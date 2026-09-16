@@ -18,12 +18,15 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
+import com.qihao.filtercamera.domain.model.BatchConfig
 import com.qihao.filtercamera.domain.model.BeautyLevel
 import com.qihao.filtercamera.domain.model.CameraLens
 import com.qihao.filtercamera.domain.model.FilterType
+import com.qihao.filtercamera.domain.repository.IBatchRepository
 import com.qihao.filtercamera.domain.repository.ICameraRepository
 import com.qihao.filtercamera.domain.repository.IFilterRepository
 import com.qihao.filtercamera.domain.repository.IMediaRepository
+import com.qihao.filtercamera.domain.repository.ISettingsRepository
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import java.io.File
@@ -36,14 +39,17 @@ import javax.inject.Singleton
  * 整合所有相机操作，提供简洁的API接口
  *
  * @param camera 相机仓库 - 负责CameraX操作
- * @param filter 滤镜仓库 - 负责滤镜状态管理
+ * @param filter 滤镜仓库 - 负责滤镜状态管理（水印也是滤镜的一种，在拍照时已烘焙进图像）
  * @param media 媒体仓库 - 负责文件存储
+ * @param batchRepository 批次仓库 - 负责批次命名与序号计数
  */
 @Singleton
 class CameraUseCase @Inject constructor(
     private val camera: ICameraRepository,
     private val filter: IFilterRepository,
-    private val media: IMediaRepository
+    private val media: IMediaRepository,
+    private val batchRepository: IBatchRepository,
+    private val settingsRepository: ISettingsRepository
 ) {
     // ==================== 相机绑定 ====================
 
@@ -59,17 +65,204 @@ class CameraUseCase @Inject constructor(
 
     /**
      * 执行拍照并保存到相册
+     *
+     * 批次拍摄流程：
+     * 1. 取当前选中批次（未选批次时为 null）
+     * 2. CameraX 拍照（滤镜、美颜、水印均在 CameraRepository.takePhoto 内烘焙进图像）
+     * 3. 按批次命名 + 归档目录存盘；无批次时回落默认命名
+     * 4. **存盘成功之后**才把批次序号 +1 并持久化
+     *
+     * 第 4 步的顺序是硬约束：
+     * 若先递增再存盘，存图失败就会跳号；而序号一旦跳号，
+     * 后续照片的文件名会出现空缺，且 MediaStore 遇到重名会自动加 " (1)" 后缀，
+     * 反而把连续编号彻底打乱。
+     *
      * @return 照片Uri的Result
      */
     suspend fun takePhoto(): Result<Uri> = runCatching {
+        val totalStart = System.currentTimeMillis()
+        val batch = currentBatchOrNull()                              // 拍照前取当前批次
         val photoPath = camera.takePhoto().getOrThrow()               // 调用CameraX拍照
+        val captureMs = System.currentTimeMillis() - totalStart
         val photoFile = File(photoPath)                               // 获取临时文件
         require(photoFile.exists()) { "照片文件不存在: $photoPath" }   // 校验文件存在
         val imageData = photoFile.readBytes()                         // 读取图片数据
-        val fileName = media.generatePhotoFileName()                  // 生成文件名
-        val uri = media.savePhoto(imageData, fileName).getOrThrow()   // 保存到MediaStore
+
+        // 「自动保存」关闭时不写入系统相册，改存到应用私有目录。
+        // 仍然要把照片留下 —— 静默丢弃比"没保存"更糟。
+        val autoSave = isAutoSaveEnabled()
+        val uri = if (autoSave) {
+            // 按批次命名与归档；未选批次时回落默认命名 IMG_yyyyMMdd_HHmmss.jpg
+            if (batch != null) {
+                media.savePhoto(imageData, batch).getOrThrow()
+            } else {
+                media.savePhoto(imageData, media.generatePhotoFileName()).getOrThrow()
+            }
+        } else {
+            val name = if (batch != null) {
+                batch.nextFileName()
+            } else {
+                "${media.generatePhotoFileName()}.jpg"
+            }
+            media.savePhotoToAppPrivate(imageData, name).getOrThrow()
+        }
+
         photoFile.delete()                                            // 清理临时文件
+        android.util.Log.d(
+            "CameraUseCase",
+            "takePhoto: [耗时] 拍照处理=${captureMs}ms, 写入相册=${System.currentTimeMillis() - totalStart - captureMs}ms, " +
+                "总计=${System.currentTimeMillis() - totalStart}ms, 图片大小=${imageData.size / 1024}KB, 路径=$uri"
+        )
+
+        // 存盘成功后才递增序号
+        if (batch != null) {
+            advanceAfterShotQuietly(batch)
+        }
+
         uri                                                           // 返回保存的Uri
+    }
+
+    /**
+     * 是否启用自动保存（写入系统相册）
+     *
+     * 读失败时按"开启"处理：宁可能存下来，也不要因为读设置失败把照片弄丢。
+     */
+    private suspend fun isAutoSaveEnabled(): Boolean = try {
+        settingsRepository.isAutoSaveEnabled().first()
+    } catch (e: Exception) {
+        android.util.Log.w("CameraUseCase", "isAutoSaveEnabled: 读取失败，按开启处理", e)
+        true
+    }
+
+    /**
+     * 作废上一张照片
+     *
+     * 语义是"这张拍坏了，用同一个名字重拍"，所以两件事必须一起做：
+     * 1. 删掉刚存的那张废片（否则重拍会与它同名，MediaStore 会加 " (1)" 后缀）
+     * 2. 把批次的名字序号回退一位
+     *
+     * 顺序：先删文件再回退计数。若先回退，而删文件失败，
+     * 就会出现"序号退了但废片还在"——重拍时又撞名。反过来则最多是
+     * "照片删了但序号没退"，重拍时序号跳一号，不会重名、不会丢照片。
+     *
+     * @return 操作结果
+     */
+    suspend fun undoLastShot(): Result<Unit> = runCatching {
+        val lastUri = media.getLastSavedMediaUri().first()
+            ?: throw IllegalStateException("没有可作废的照片（应用重启后无法追溯到上一张）")
+
+        media.deleteMedia(lastUri).getOrThrow()
+        android.util.Log.d("CameraUseCase", "undoLastShot: 已删除废片 $lastUri")
+
+        val batch = currentBatchOrNull()
+        if (batch != null) {
+            batchRepository.decrementCounter(batch.id).getOrThrow()
+            android.util.Log.d(
+                "CameraUseCase",
+                "undoLastShot: 批次「${batch.name}」序号已回退，下一张 ${batch.withCounterDecremented().nextFileName()}"
+            )
+        }
+    }
+
+    /**
+     * 重拍某一项
+     *
+     * 与"跳拍"的区别：这一项已经拍过，所以先删掉原来那张照片，再把指针指回它。
+     * 顺序：先删照片再改状态 —— 删除失败就不该动状态，
+     * 否则会出现"状态说没拍、但旧照片还在"，重拍时撞名。
+     *
+     * @param batch 当前批次
+     * @param index 要重拍的名字下标
+     * @return 是否找到了旧照片（true 表示已删除；false 表示本来就没拍过）
+     */
+    suspend fun reshootName(batch: com.qihao.filtercamera.domain.model.BatchConfig, index: Int): Result<Boolean> =
+        runCatching {
+            val names = batch.effectiveNameList
+            require(index in names.indices) { "名字下标越界: $index" }
+
+            val expectedName = batch.buildCustomFileName(names[index])
+            val deleted = deletePhotosNamed(batch, expectedName)
+
+            batchRepository.markForReshoot(batch.id, index).getOrThrow()
+            android.util.Log.d(
+                "CameraUseCase",
+                "reshootName: 第 $index 项(${names[index]}) 标记为待重拍，删除旧照片=$deleted"
+            )
+            deleted
+        }
+
+    /**
+     * 按文件名删除批次目录下对应的照片
+     *
+     * 名称被 MediaStore 加过 " (1)" 后缀的也一并清理，
+     * 否则重拍后相册里会残留几张同名废片。
+     *
+     * @return 是否删除过至少一张
+     */
+    private suspend fun deletePhotosNamed(
+        batch: com.qihao.filtercamera.domain.model.BatchConfig,
+        expectedName: String
+    ): Boolean {
+        val stem = expectedName.substringBeforeLast('.')
+        val photos = media.getPhotosInDir(batch.safeDirName)
+        val targets = photos.filter { photo ->
+            photo.name == expectedName ||
+                (photo.name.startsWith("$stem (") && photo.name.endsWith(".jpg"))
+        }
+        targets.forEach { media.deleteMedia(it.uri) }
+        android.util.Log.d(
+            "CameraUseCase",
+            "deletePhotosNamed: $expectedName 匹配 ${targets.size} 张 -> ${targets.map { it.name }}"
+        )
+        return targets.isNotEmpty()
+    }
+
+    /**
+     * 是否可以作废上一张
+     *
+     * 只有本进程内拍过照片才可以 —— 重启后拿不到"上一张"的 Uri，
+     * 盲目按序号回退可能会删错文件，所以宁可禁用。
+     */
+    suspend fun canUndoLastShot(): Boolean = try {
+        media.getLastSavedMediaUri().first() != null
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * 开始新一轮拍摄
+     */
+    suspend fun startNewRound(batchId: String): Result<Unit> =
+        batchRepository.startNewRound(batchId)
+
+    /**
+     * 读取当前选中批次
+     *
+     * 持久层读失败不应阻断拍照，降级为"不使用批次"。
+     */
+    private suspend fun currentBatchOrNull(): BatchConfig? = try {
+        batchRepository.currentBatch.first()
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * 递增批次已拍张数
+     *
+     * 照片此时已经落盘，计数器写失败属于极小概率事件（磁盘满/IO异常）。
+     * 这里选择"吞掉异常并记录"而不是让整次拍照报失败 —— 向用户谎报"拍照失败"
+     * 比极少数情况下文件名重复更糟；真的失败了日志里也有据可查。
+     */
+    private suspend fun advanceAfterShotQuietly(batch: BatchConfig) {
+        batchRepository.advanceAfterShot(batch.id).onFailure { error ->
+            android.util.Log.e(
+                "CameraUseCase",
+                "advanceAfterShotQuietly: 批次计数推进失败 id=${batch.id}，" +
+                    "该照片已保存为 ${batch.nextFileName()}，" +
+                    "下一张可能出现重名（MediaStore 会追加 \" (1)\" 后缀）",
+                error
+            )
+        }
     }
 
     // ==================== 录像操作 ====================

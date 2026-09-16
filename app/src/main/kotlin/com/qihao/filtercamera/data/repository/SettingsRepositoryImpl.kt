@@ -23,6 +23,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.qihao.filtercamera.data.local.SettingsDefaults
 import com.qihao.filtercamera.data.local.SettingsKeys
 import com.qihao.filtercamera.domain.model.FilterType
+import com.qihao.filtercamera.domain.model.WatermarkField
 import com.qihao.filtercamera.domain.repository.GridType
 import com.qihao.filtercamera.domain.repository.ISettingsRepository
 import com.qihao.filtercamera.domain.repository.PhotoQuality
@@ -244,6 +245,62 @@ class SettingsRepositoryImpl @Inject constructor(
         Log.d(TAG, "setWatermarkText: $text")
         dataStore.edit { preferences ->
             preferences[SettingsKeys.WATERMARK_TEXT] = text
+        }
+    }
+
+    /**
+     * 获取信息水印要显示的字段集合
+     */
+    override fun getWatermarkFields(): Flow<Set<WatermarkField>> = dataStore.data
+        .catch { exception ->
+            Log.e(TAG, "getWatermarkFields: 读取失败", exception)
+            if (exception is IOException) {
+                emit(androidx.datastore.preferences.core.emptyPreferences())
+            } else {
+                throw exception
+            }
+        }
+        .map { preferences ->
+            val raw = preferences[SettingsKeys.WATERMARK_FIELDS]
+                ?: SettingsDefaults.WATERMARK_FIELDS
+            WatermarkField.fromIds(raw)
+        }
+
+    /**
+     * 设置信息水印要显示的字段集合
+     */
+    override suspend fun setWatermarkFields(fields: Set<WatermarkField>) {
+        val encoded = WatermarkField.toIds(fields)
+        Log.d(TAG, "setWatermarkFields: $encoded")
+        dataStore.edit { preferences ->
+            preferences[SettingsKeys.WATERMARK_FIELDS] = encoded
+        }
+    }
+
+    /**
+     * 获取水印大小倍率
+     */
+    override fun getWatermarkSizeScale(): Flow<Float> = dataStore.data
+        .catch { exception ->
+            Log.e(TAG, "getWatermarkSizeScale: 读取失败", exception)
+            if (exception is IOException) {
+                emit(androidx.datastore.preferences.core.emptyPreferences())
+            } else {
+                throw exception
+            }
+        }
+        .map { preferences ->
+            preferences[SettingsKeys.WATERMARK_SIZE_SCALE] ?: SettingsDefaults.WATERMARK_SIZE_SCALE
+        }
+
+    /**
+     * 设置水印大小倍率
+     */
+    override suspend fun setWatermarkSizeScale(scale: Float) {
+        val clamped = scale.coerceIn(0.5f, 2.0f)
+        Log.d(TAG, "setWatermarkSizeScale: $clamped")
+        dataStore.edit { preferences ->
+            preferences[SettingsKeys.WATERMARK_SIZE_SCALE] = clamped
         }
     }
 

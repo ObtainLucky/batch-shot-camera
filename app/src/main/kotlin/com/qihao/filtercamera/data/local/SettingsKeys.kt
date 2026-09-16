@@ -62,6 +62,12 @@ object SettingsKeys {
     /** 自定义水印文字键 */
     val WATERMARK_TEXT = stringPreferencesKey("watermark_text")
 
+    /** 信息水印显示哪些字段键 - 存储逗号分隔的字段 id */
+    val WATERMARK_FIELDS = stringPreferencesKey("watermark_fields")
+
+    /** 水印大小倍率键 - 浮点，1.0 为基准 */
+    val WATERMARK_SIZE_SCALE = floatPreferencesKey("watermark_size_scale")
+
     // ==================== 保存位置设置 ====================
 
     /** 保存位置键 - 存储枚举名称 */
@@ -143,6 +149,12 @@ object SettingsDefaults {
 
     /** 自定义水印默认文字 */
     const val WATERMARK_TEXT = "FilterCamera"
+
+    /** 信息水印默认显示全部字段（与 WatermarkField.DEFAULT_IDS 对应） */
+    const val WATERMARK_FIELDS = "longitude,latitude,address,time,weather,remark"
+
+    /** 水印大小默认 1.0 倍 */
+    const val WATERMARK_SIZE_SCALE = 1.0f
 
     // ==================== 保存位置设置默认值 ====================
 

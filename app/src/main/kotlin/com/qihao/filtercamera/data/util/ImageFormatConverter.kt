@@ -24,6 +24,7 @@ import android.graphics.YuvImage
 import android.util.Log
 import androidx.camera.core.ImageProxy
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
 
 /**
  * 图像格式转换工具类
@@ -33,6 +34,9 @@ import java.io.ByteArrayOutputStream
 object ImageFormatConverter {
 
     private const val TAG = "ImageFormatConverter"                    // 日志标签
+
+    /** UV 平面像素跨距（半平面 YUV_420_888 的常见取值，U/V 交错存放） */
+    private const val UV_PIXEL_STRIDE = 2
 
     /**
      * YUV 转换配置
@@ -67,23 +71,47 @@ object ImageFormatConverter {
      * @return NV21 格式的字节数组
      */
     fun yuvImageProxyToNv21(imageProxy: ImageProxy): ByteArray {
-        val width = imageProxy.width
-        val height = imageProxy.height
-
-        // 获取 YUV 平面
         val yPlane = imageProxy.planes[0]
         val uPlane = imageProxy.planes[1]
         val vPlane = imageProxy.planes[2]
 
-        val yBuffer = yPlane.buffer
-        val uBuffer = uPlane.buffer
-        val vBuffer = vPlane.buffer
+        return yuv420ToNv21(
+            yBuffer = yPlane.buffer,
+            uBuffer = uPlane.buffer,
+            vBuffer = vPlane.buffer,
+            width = imageProxy.width,
+            height = imageProxy.height,
+            yRowStride = yPlane.rowStride,
+            uvRowStride = uPlane.rowStride,
+            uvPixelStride = uPlane.pixelStride
+        )
+    }
 
-        // 获取步长信息
-        val yRowStride = yPlane.rowStride
-        val uvRowStride = uPlane.rowStride
-        val uvPixelStride = uPlane.pixelStride
-
+    /**
+     * YUV_420_888 三个平面转 NV21（纯缓冲区运算，便于单元测试）
+     *
+     * 与 [yuvImageProxyToNv21] 的区别只是入参形态，逻辑完全一致。
+     *
+     * @param yBuffer Y 平面
+     * @param uBuffer U 平面
+     * @param vBuffer V 平面
+     * @param width 图像宽度
+     * @param height 图像高度
+     * @param yRowStride Y 平面行跨距
+     * @param uvRowStride UV 平面行跨距
+     * @param uvPixelStride UV 平面像素跨距
+     * @return NV21 格式的字节数组
+     */
+    internal fun yuv420ToNv21(
+        yBuffer: ByteBuffer,
+        uBuffer: ByteBuffer,
+        vBuffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        yRowStride: Int,
+        uvRowStride: Int,
+        uvPixelStride: Int
+    ): ByteArray {
         // 创建 NV21 格式的字节数组（Y + VU 交错）
         val nv21 = ByteArray(width * height * 3 / 2)
 
@@ -106,16 +134,97 @@ object ImageFormatConverter {
         val uvHeight = height / 2
         val uvWidth = width / 2
 
-        for (row in 0 until uvHeight) {
-            for (col in 0 until uvWidth) {
-                val uvIndex = row * uvRowStride + col * uvPixelStride
-                // NV21 格式：先 V 后 U
-                nv21[pos++] = vBuffer.get(uvIndex)
-                nv21[pos++] = uBuffer.get(uvIndex)
+        // 性能优化：逐字节 ByteBuffer.get(index) 在 1200 万像素上有约 300 万次调用，
+        // 每次都是带边界检查的方法调用，是这段转换的主要开销。
+        // 改成按行 bulk 读入临时数组后按下标取，输出字节与逐字节读取完全一致。
+        if (uvPixelStride == UV_PIXEL_STRIDE) {
+            copyUvPlanesInterleavedFast(uBuffer, vBuffer, uvRowStride, uvWidth, uvHeight, nv21, pos)
+        } else {
+            // 非 2 步长（平面式 I420 等）保留通用实现
+            for (row in 0 until uvHeight) {
+                for (col in 0 until uvWidth) {
+                    val uvIndex = row * uvRowStride + col * uvPixelStride
+                    // NV21 格式：先 V 后 U
+                    nv21[pos++] = vBuffer.get(uvIndex)
+                    nv21[pos++] = uBuffer.get(uvIndex)
+                }
             }
         }
 
         return nv21
+    }
+
+    /**
+     * UV 平面批量交错复制（pixelStride == 2 的常见情况）
+     *
+     * NV12 的 UV 平面是 U,V,U,V... 顺序，NV21 要求 V,U,V,U...，
+     * 因此按行读入后交换相邻两字节写入。
+     *
+     * 每行只读真正需要的字节数（不含行尾填充），既省一次分配也避免依赖 rowStride。
+     * 若某个 buffer 剩余长度不足（罕见的分片布局），该行退化为逐字节读取，
+     * 而不是整段结果被静默截断。
+     *
+     * @param uBuffer U 平面缓冲
+     * @param vBuffer V 平面缓冲
+     * @param uvRowStride UV 平面行跨距
+     * @param uvWidth UV 平面宽度（= 图像宽度 / 2）
+     * @param uvHeight UV 平面高度（= 图像高度 / 2）
+     * @param out 输出去（NV21）
+     * @param outOffset 写入起始下标
+     */
+    private fun copyUvPlanesInterleavedFast(
+        uBuffer: ByteBuffer,
+        vBuffer: ByteBuffer,
+        uvRowStride: Int,
+        uvWidth: Int,
+        uvHeight: Int,
+        out: ByteArray,
+        outOffset: Int
+    ) {
+        var pos = outOffset
+        val neededBytes = uvWidth * UV_PIXEL_STRIDE
+        val uRow = ByteArray(neededBytes)
+        val vRow = ByteArray(neededBytes)
+
+        for (row in 0 until uvHeight) {
+            val rowOffset = row * uvRowStride
+
+            val uRead = readRow(uBuffer, rowOffset, uRow, neededBytes)
+            val vRead = readRow(vBuffer, rowOffset, vRow, neededBytes)
+
+            if (!uRead || !vRead) {
+                // 该行无法批量读，退化为逐字节（与原实现一致）
+                for (col in 0 until uvWidth) {
+                    val index = rowOffset + col * UV_PIXEL_STRIDE
+                    out[pos++] = vBuffer.get(index)
+                    out[pos++] = uBuffer.get(index)
+                }
+                continue
+            }
+
+            for (col in 0 until uvWidth) {
+                val index = col * UV_PIXEL_STRIDE
+                out[pos++] = vRow[index]                                  // 先 V
+                out[pos++] = uRow[index]                                  // 后 U
+            }
+        }
+    }
+
+    /**
+     * 从 [offset] 起批量读出 [length] 字节
+     *
+     * @return 数据足够时返回 true；剩余长度不足返回 false（调用方需退化处理）
+     */
+    private fun readRow(
+        buffer: ByteBuffer,
+        offset: Int,
+        target: ByteArray,
+        length: Int
+    ): Boolean {
+        if (offset < 0 || offset + length > buffer.limit()) return false
+        buffer.position(offset)
+        buffer.get(target, 0, length)
+        return true
     }
 
     /**

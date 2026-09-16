@@ -25,6 +25,7 @@ import android.graphics.PorterDuffXfermode
 import android.util.Log
 import com.qihao.filter.factory.GPUImageFilterFactory
 import com.qihao.filter.watermark.WatermarkRenderer
+import com.qihao.filtercamera.data.watermark.WatermarkInfoProvider
 import com.qihao.filtercamera.domain.model.FilterType
 import com.qihao.filtercamera.domain.repository.IFilterRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -43,10 +44,12 @@ import javax.inject.Singleton
  * 使用GPUImage库实现滤镜渲染
  *
  * @param context 应用上下文
+ * @param watermarkInfoProvider 信息水印数据（定位/地址/天气/备注）
  */
 @Singleton
 class FilterRepositoryImpl @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val watermarkInfoProvider: WatermarkInfoProvider
 ) : IFilterRepository {
 
     companion object {
@@ -138,7 +141,12 @@ class FilterRepositoryImpl @Inject constructor(
         sourceBitmap: Bitmap
     ): Bitmap? = withContext(Dispatchers.Default) {
         Log.d(TAG, "getFilterThumbnail: 生成滤镜缩略图 filterType=$filterType")
-        applyGpuFilterCore(filterType, sourceBitmap).also { result ->
+        // 走 applyFilterCore 而不是 applyGpuFilterCore：
+        // 水印类滤镜 useGpu=false，走 GPU 分支只会得到原图，
+        // 导致选择器里所有水印项缩略图一模一样、看不出效果。
+        // 也刻意不走 applyFilterInternal：那里会叠加设置里开启的信息水印，
+        // 会让每一个滤镜缩略图都糊上一块信息面板。
+        applyFilterCore(filterType, sourceBitmap).also { result ->
             if (result != null) {
                 Log.d(TAG, "getFilterThumbnail: 缩略图生成成功")
             } else {
@@ -175,22 +183,41 @@ class FilterRepositoryImpl @Inject constructor(
      * @return 应用滤镜后的图片
      */
     private fun applyFilterInternal(filterType: FilterType, sourceBitmap: Bitmap): Bitmap? {
+        // 第一步：算滤镜结果
+        val filtered = applyFilterCore(filterType, sourceBitmap)
+        // 第二步：按设置叠加信息水印（与滤镜选择相互独立，类似相机的日期印字）
+        return decorateWithInfoWatermarkIfNeeded(filterType, filtered)
+    }
+
+    /**
+     * 滤镜核心逻辑（不含信息水印叠加）
+     *
+     * 处理NONE滤镜、水印类型和GPU滤镜
+     * 支持滤镜强度控制（0.0~1.0）
+     *
+     * @param filterType 滤镜类型
+     * @param sourceBitmap 源图片
+     * @return 应用滤镜后的图片
+     */
+    private fun applyFilterCore(filterType: FilterType, sourceBitmap: Bitmap): Bitmap? {
         // 如果是原图滤镜，直接返回原图
         if (filterType == FilterType.NONE) {
-            Log.d(TAG, "applyFilterInternal: 原图滤镜，直接返回")
+            Log.d(TAG, "applyFilterCore: 原图滤镜，直接返回")
             return sourceBitmap
+        }
+
+        // 水印类型用Canvas绘制，且不受滤镜强度影响
+        // 注意：这个判断必须在「强度为0」之前。水印自己不支持强度调节，
+        // 若先判强度，用户把强度拖到 0 就会连水印一起消失。
+        if (FilterType.isWatermarkType(filterType)) {
+            Log.d(TAG, "applyFilterCore: 水印滤镜，应用Canvas水印")
+            return applyWatermarkToBitmap(filterType, sourceBitmap)
         }
 
         // 如果强度为0，直接返回原图
         if (_currentIntensity <= 0f) {
-            Log.d(TAG, "applyFilterInternal: 强度为0，返回原图")
+            Log.d(TAG, "applyFilterCore: 强度为0，返回原图")
             return sourceBitmap
-        }
-
-        // 如果是水印类型，使用Canvas绘制水印（水印不支持强度调节）
-        if (FilterType.isWatermarkType(filterType)) {
-            Log.d(TAG, "applyFilterInternal: 水印滤镜，应用Canvas水印")
-            return applyWatermarkToBitmap(filterType, sourceBitmap)
         }
 
         // 应用GPU滤镜
@@ -198,13 +225,31 @@ class FilterRepositoryImpl @Inject constructor(
 
         // 如果强度为1，直接返回滤镜图
         if (_currentIntensity >= 1f) {
-            Log.d(TAG, "applyFilterInternal: 强度为1，返回滤镜图")
+            Log.d(TAG, "applyFilterCore: 强度为1，返回滤镜图")
             return filteredBitmap
         }
 
         // 强度混合：将原图和滤镜图按比例混合
-        Log.d(TAG, "applyFilterInternal: 强度混合 intensity=$_currentIntensity")
+        Log.d(TAG, "applyFilterCore: 强度混合 intensity=$_currentIntensity")
         return blendBitmaps(sourceBitmap, filteredBitmap, _currentIntensity)
+    }
+
+    /**
+     * 按设置叠加信息水印
+     *
+     * 设置页「信息水印」开关打开时，给每张照片（含预览）叠加经纬度/地址/时间/天气/备注面板。
+     * 若用户已经显式选了某个水印滤镜，则不再叠加，避免两层水印打架。
+     */
+    private fun decorateWithInfoWatermarkIfNeeded(
+        filterType: FilterType,
+        bitmap: Bitmap?
+    ): Bitmap? {
+        if (bitmap == null) return null
+        if (!watermarkInfoProvider.isInfoWatermarkEnabled()) return bitmap
+        if (FilterType.isWatermarkType(filterType)) return bitmap            // 已选水印，避免重复叠加
+
+        Log.d(TAG, "decorateWithInfoWatermarkIfNeeded: 叠加信息水印（设置已开启）")
+        return applyWatermarkToBitmap(FilterType.WATERMARK_INFO, bitmap)
     }
 
     /**
@@ -348,19 +393,41 @@ class FilterRepositoryImpl @Inject constructor(
         return applyFilterInternal(filterType, sourceBitmap)
     }
 
+    /**
+     * 信息水印开关是否打开
+     */
+    override fun isInfoWatermarkEnabled(): Boolean = watermarkInfoProvider.isInfoWatermarkEnabled()
+
     // ==================== 水印相关 ====================
 
-    // 当前水印数据
-    private var currentWatermarkData = WatermarkRenderer.WatermarkData()
+    /**
+     * 运行期临时覆盖备注文字（null 表示使用设置页里填的备注）
+     *
+     * 保留这个方法是为了给后续"按批次设置备注"留口子，
+     * 正常情况下备注统一来自设置页，由 WatermarkInfoProvider 监听。
+     */
+    private var customTextOverride: String? = null
 
     /**
-     * 设置自定义水印文字
+     * 设置自定义水印文字（覆盖设置页的备注）
      *
-     * @param text 自定义文字
+     * @param text 自定义文字，传空串表示恢复使用设置页备注
      */
     fun setCustomWatermarkText(text: String) {
-        currentWatermarkData = currentWatermarkData.copy(customText = text)
-        Log.d(TAG, "setCustomWatermarkText: 自定义文字=$text")
+        customTextOverride = text.takeIf { it.isNotBlank() }
+        Log.d(TAG, "setCustomWatermarkText: 覆盖备注=${customTextOverride ?: "(恢复设置页备注)"}")
+    }
+
+    /**
+     * 取当前水印数据
+     *
+     * 数据由 WatermarkInfoProvider 在后台维护成快照，这里同步读取，不阻塞渲染。
+     * 同时顺手触发一次按需刷新（内部有频率保护，未过期时直接返回）。
+     */
+    private fun currentWatermarkData(): WatermarkRenderer.WatermarkData {
+        watermarkInfoProvider.refreshIfStale()
+        val snapshot = watermarkInfoProvider.snapshot()
+        return customTextOverride?.let { snapshot.copy(customText = it) } ?: snapshot
     }
 
     /**
@@ -373,13 +440,18 @@ class FilterRepositoryImpl @Inject constructor(
      * @return 带水印的图片
      */
     private fun applyWatermarkToBitmap(filterType: FilterType, sourceBitmap: Bitmap): Bitmap {
-        // 更新时间戳为当前时间
-        val data = currentWatermarkData.copy(timestamp = System.currentTimeMillis())
+        // 时间戳取拍照/预览当下的时间，其余字段（经纬度/地址/天气/备注）取快照
+        val data = currentWatermarkData().copy(timestamp = System.currentTimeMillis())
 
         // 转换FilterType到WatermarkType
         val watermarkType = filterTypeToWatermarkType(filterType)
 
-        Log.d(TAG, "applyWatermarkToBitmap: 应用水印 type=$watermarkType")
+        Log.d(
+            TAG,
+            "applyWatermarkToBitmap: 应用水印 type=$watermarkType, " +
+                "有定位=${data.latitude != null}, 有地址=${!data.address.isNullOrBlank()}, " +
+                "有天气=${!data.weather.isNullOrBlank()}, 有备注=${data.customText.isNotBlank()}"
+        )
 
         return WatermarkRenderer.applyWatermark(sourceBitmap, watermarkType, data)
     }
@@ -396,6 +468,7 @@ class FilterRepositoryImpl @Inject constructor(
             FilterType.WATERMARK_DATE -> WatermarkRenderer.WatermarkType.DATE
             FilterType.WATERMARK_DEVICE -> WatermarkRenderer.WatermarkType.DEVICE
             FilterType.WATERMARK_CUSTOM -> WatermarkRenderer.WatermarkType.CUSTOM
+            FilterType.WATERMARK_INFO -> WatermarkRenderer.WatermarkType.INFO
             else -> WatermarkRenderer.WatermarkType.TIMESTAMP                 // 默认时间戳
         }
     }

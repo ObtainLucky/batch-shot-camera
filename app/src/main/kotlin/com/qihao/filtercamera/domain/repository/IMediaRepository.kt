@@ -11,6 +11,7 @@ package com.qihao.filtercamera.domain.repository
 
 import android.graphics.Bitmap
 import android.net.Uri
+import com.qihao.filtercamera.domain.model.BatchConfig
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -72,12 +73,62 @@ interface IMediaRepository {
     suspend fun savePhoto(imageData: ByteArray, fileName: String): Result<Uri>
 
     /**
+     * 保存照片到指定批次（从Bitmap）
+     *
+     * 文件名由批次规则生成（如 BA_001.jpg），并归入 Pictures/{dirName}/ 目录。
+     * 序号取自 batch.nextSeq()，即批次快照里的计数器 —— 递增由调用方在存盘成功后完成。
+     *
+     * @param bitmap 图像数据
+     * @param batch 批次配置
+     * @return 保存结果，包含文件Uri
+     */
+    suspend fun savePhoto(bitmap: Bitmap, batch: BatchConfig): Result<Uri>
+
+    /**
+     * 保存照片到指定批次（从字节数组）
+     *
+     * @param imageData JPEG图像字节数据
+     * @param batch 批次配置
+     * @return 保存结果，包含文件Uri
+     */
+    suspend fun savePhoto(imageData: ByteArray, batch: BatchConfig): Result<Uri>
+
+    /**
+     * 保存照片到应用私有目录（不写入系统相册）
+     *
+     * 用于「自动保存」关闭时：照片仍要留下来，不能被静默丢弃，
+     * 但不出现在系统相册里。
+     *
+     * @param imageData JPEG图像字节数据
+     * @param fileName 文件名（含扩展名）
+     * @return 保存结果，Uri 为 file:// 形式
+     */
+    suspend fun savePhotoToAppPrivate(imageData: ByteArray, fileName: String): Result<Uri>
+
+    /**
      * 保存视频到相册
      * @param videoPath 视频临时文件路径
      * @param fileName 文件名（不含扩展名）
      * @return 保存结果，包含文件Uri
      */
     suspend fun saveVideo(videoPath: String, fileName: String): Result<Uri>
+
+    /**
+     * 查询指定目录下的照片（用于导出批次清单）
+     *
+     * @param relativePathHint 目录名或目录名片段，如 "工作/设备上架"
+     * @return 按拍摄时间升序排列的照片列表
+     */
+    suspend fun getPhotosInDir(relativePathHint: String): List<MediaFile>
+
+    /**
+     * 保存文本文件到「文档」目录（用于导出 CSV 清单）
+     *
+     * @param fileName 完整文件名（含扩展名）
+     * @param content 文本内容
+     * @return 保存结果的 Uri
+     */
+    suspend fun saveTextDocument(fileName: String, content: String): Result<Uri>
 
     /**
      * 获取最近的媒体文件

@@ -23,15 +23,23 @@ import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import androidx.exifinterface.media.ExifInterface
+import com.qihao.filtercamera.di.ApplicationScope
+import com.qihao.filtercamera.domain.model.BatchConfig
+import com.qihao.filtercamera.domain.repository.IBatchRepository
 import com.qihao.filtercamera.domain.repository.IMediaRepository
+import com.qihao.filtercamera.domain.repository.ISettingsRepository
+import com.qihao.filtercamera.domain.repository.SaveLocation
 import com.qihao.filtercamera.domain.repository.MediaFile
 import com.qihao.filtercamera.domain.repository.MediaType
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
@@ -45,10 +53,15 @@ import javax.inject.Singleton
  * 媒体仓库实现类
  *
  * @param context 应用上下文
+ * @param batchRepository 批次仓库 - 用于把批次目录纳入相册查询范围
+ * @param applicationScope 应用级协程作用域 - 用于常驻监听批次目录变化
  */
 @Singleton
 class MediaRepositoryImpl @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val batchRepository: IBatchRepository,
+    private val settingsRepository: ISettingsRepository,
+    @ApplicationScope private val applicationScope: CoroutineScope
 ) : IMediaRepository {
 
     companion object {
@@ -58,80 +71,345 @@ class MediaRepositoryImpl @Inject constructor(
         private const val PHOTO_EXTENSION = ".jpg"       // 照片扩展名
         private const val VIDEO_EXTENSION = ".mp4"       // 视频扩展名
         private const val ALBUM_NAME = "FilterCamera"    // 相册名称
+
+        /** 未选批次时的兜底保存目录：Pictures/FilterCamera */
+        private val FALLBACK_RELATIVE_PATH = "${Environment.DIRECTORY_PICTURES}/$ALBUM_NAME"
+
+        /** JPEG 压缩质量（兜底值，实际跟随设置页） */
+        private const val JPEG_QUALITY = 95
+
+        /** 「自动保存」关闭时照片的私有目录名 */
+        private const val PRIVATE_UNSAVED_DIR = "unsaved_shots"
     }
+
+    /**
+     * 未选批次时的默认保存目录（跟随设置页的「保存位置」）
+     *
+     * 相册 -> DCIM/FilterCamera，图片 -> Pictures/FilterCamera，
+     * 自定义 -> 用户填写的相对路径（非法或为空则回落「图片」）。
+     * 注意：选中批次时**批次目录优先**，批次的意义就是按批归档，
+     * 不能被全局保存位置覆盖。
+     */
+    @Volatile
+    private var defaultRelativePath: String = FALLBACK_RELATIVE_PATH
+
+    /** 拍照/编辑保存的 JPEG 质量（跟随设置页的「照片质量」） */
+    @Volatile
+    private var jpegQuality: Int = JPEG_QUALITY
 
     // 最后保存的媒体Uri状态流
     private val _lastSavedMediaUri = MutableStateFlow<Uri?>(null)
 
     /**
-     * 保存照片到相册（从Bitmap）
+     * 属于本应用的相册目录名集合（FilterCamera + 所有批次目录）
+     *
+     * 读取侧要用它构造查询条件，否则存到 Pictures/BatchA/ 的批次照片
+     * 会因为原来的 "只查 FilterCamera 目录" 过滤而在应用相册里看不见。
      */
-    override suspend fun savePhoto(bitmap: Bitmap, fileName: String): Result<Uri> =
-        withContext(Dispatchers.IO) {
-            try {
-                Log.d(TAG, "savePhoto: 开始保存照片 fileName=$fileName")
-                val contentValues = createImageContentValues(fileName)
-                val uri = context.contentResolver.insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    contentValues
-                ) ?: return@withContext Result.failure(Exception("创建媒体文件失败"))
+    @Volatile
+    private var albumDirs: List<String> = listOf(ALBUM_NAME)
 
-                Log.d(TAG, "savePhoto: 创建Uri成功 uri=$uri")
+    /** 最近一次读到的批次列表（供路径解析复用） */
+    @Volatile
+    private var cachedBatches: List<com.qihao.filtercamera.domain.model.BatchConfig> = emptyList()
 
-                context.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, outputStream)
-                    Log.d(TAG, "savePhoto: 图像压缩写入成功")
-                } ?: return@withContext Result.failure(Exception("打开输出流失败"))
+    /** 当前保存位置（用于自定义路径变更时重算） */
+    @Volatile
+    private var currentSaveLocation: SaveLocation = SaveLocation.PICTURES
 
-                // 更新IS_PENDING状态（Android 10+）
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    contentValues.clear()
-                    contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    context.contentResolver.update(uri, contentValues, null, null)
-                }
+    /** 用户填写的自定义保存路径 */
+    @Volatile
+    private var customSavePath: String = ""
 
-                _lastSavedMediaUri.value = uri
-                Log.d(TAG, "savePhoto: 照片保存成功 uri=$uri")
-                Result.success(uri)
-            } catch (e: Exception) {
-                Log.e(TAG, "savePhoto: 保存照片失败", e)
-                Result.failure(e)
+    /**
+     * 刷新"属于本应用的相册目录"集合
+     *
+     * 读取侧靠它构造查询条件。除了固定相册名，还要把批次目录、
+     * 以及自定义保存路径的最后一级目录纳入，否则这些照片在 App 相册里看不到。
+     */
+    private fun refreshAlbumDirs() {
+        val dirs = buildList {
+            add(ALBUM_NAME)
+            cachedBatches.forEach { batch ->
+                val dir = batch.safeDirName
+                if (dir.isNotEmpty() && dir !in this) add(dir)
             }
+            // 自定义路径的最后一级目录（DCIM/Pictures 分支的目录名就是 FilterCamera，已在上面）
+            defaultRelativePath.substringAfterLast('/')
+                .takeIf { it.isNotBlank() && it != ALBUM_NAME && it !in this }
+                ?.let { add(it) }
+        }
+        albumDirs = dirs
+        Log.d(TAG, "refreshAlbumDirs: 相册目录=$dirs")
+    }
+
+    /**
+     * 观察保存位置与照片质量设置
+     */
+    private fun observeSettings() {
+        applicationScope.launch {
+            settingsRepository.getSaveLocation()
+                .catch { e -> Log.w(TAG, "observeSettings: 读取保存位置失败", e) }
+                .collect { location ->
+                    currentSaveLocation = location
+                    defaultRelativePath = resolveSavePath(location)
+                    refreshAlbumDirs()
+                    Log.d(TAG, "observeSettings: 保存位置=${location.displayName} -> $defaultRelativePath")
+                }
+        }
+
+        applicationScope.launch {
+            settingsRepository.getCustomSavePath()
+                .catch { e -> Log.w(TAG, "observeSettings: 读取自定义路径失败", e) }
+                .collect { path ->
+                    customSavePath = path
+                    defaultRelativePath = resolveSavePath(currentSaveLocation)
+                    refreshAlbumDirs()
+                    Log.d(TAG, "observeSettings: 自定义路径=$path -> $defaultRelativePath")
+                }
+        }
+
+        applicationScope.launch {
+            settingsRepository.getPhotoQuality()
+                .catch { e -> Log.w(TAG, "observeSettings: 读取照片质量失败", e) }
+                .collect { quality ->
+                    jpegQuality = quality.compressionQuality
+                    Log.d(TAG, "observeSettings: JPEG 质量=$jpegQuality")
+                }
+        }
+    }
+
+    /**
+     * 解析保存位置对应的相对路径
+     */
+    private fun resolveSavePath(location: SaveLocation): String = when (location) {
+        SaveLocation.DCIM -> "${Environment.DIRECTORY_DCIM}/$ALBUM_NAME"
+        SaveLocation.PICTURES -> "${Environment.DIRECTORY_PICTURES}/$ALBUM_NAME"
+        SaveLocation.CUSTOM -> customSavePath
+            .trim()
+            .trim('/')
+            .takeIf { it.isNotBlank() }
+            ?.let { sanitizeRelativePath(it) }
+            ?.takeIf { it.isNotBlank() }
+            ?: FALLBACK_RELATIVE_PATH
+    }
+
+    /**
+     * 清理自定义路径：去掉非法字符与 .. 片段，避免目录穿越
+     */
+    private fun sanitizeRelativePath(raw: String): String =
+        raw.split('/')
+            .map { it.replace(Regex("[\\:*?\"<>|]"), "").trim('.', ' ') }
+            .filter { it.isNotBlank() && it != "." && it != ".." }
+            .joinToString("/")
+
+    /**
+     * 常驻监听批次列表，保持 [albumDirs] 最新
+     */
+    init {
+        observeSettings()
+        applicationScope.launch {
+            batchRepository.batches
+                .catch { e -> Log.e(TAG, "init: 监听批次目录失败", e) }
+                .collect { batches ->
+                    cachedBatches = batches
+                    refreshAlbumDirs()
+                }
+        }
+    }
+
+    /**
+     * 相册归属判断使用的列名
+     *
+     * Android 10+ 用 RELATIVE_PATH；Android 9 及以下该列不存在，只能用 DATA 绝对路径。
+     */
+    private val albumPathColumn: String
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.MediaColumns.RELATIVE_PATH
+        } else {
+            MediaStore.MediaColumns.DATA
         }
 
     /**
+     * 构造"本应用相册"的查询条件
+     *
+     * 形如：relative_path LIKE ? OR relative_path LIKE ?
+     * 参数形如：%/FilterCamera/%, %/BatchA/%
+     *
+     * 用 "/目录/" 前后包裹，既匹配目录直属文件（RELATIVE_PATH 以 / 结尾），
+     * 也匹配按日期分子目录的文件（Pictures/BatchA/2026-09-16/）。
+     *
+     * @return 选择条件与参数
+     */
+    private fun buildAlbumSelection(): Pair<String, Array<String>> {
+        val column = albumPathColumn
+        val dirs = albumDirs                                              // 一次性读取，避免多线程下取到不同快照
+        val selection = dirs.joinToString(" OR ") { "$column LIKE ?" }
+        val args = dirs.map { "%/$it/%" }.toTypedArray()
+        return selection to args
+    }
+
+    /**
+     * 保存照片到相册（从Bitmap）
+     *
+     * 默认命名：IMG_yyyyMMdd_HHmmss.jpg，存 Pictures/FilterCamera/
+     */
+    override suspend fun savePhoto(bitmap: Bitmap, fileName: String): Result<Uri> =
+        saveBitmap(bitmap, "$fileName$PHOTO_EXTENSION", defaultRelativePath)
+
+    /**
+     * 保存照片到指定批次（从Bitmap）
+     *
+     * 文件名：batch.nextFileName()
+     * 序号模式 -> BA_001.jpg；工作模式 -> 设备上架_拖车.jpg（按预设名字顺序）
+     * 目录：Pictures/{dirName}/（dateSubDir 为 true 时再加 yyyy-MM-dd 子目录）
+     */
+    override suspend fun savePhoto(bitmap: Bitmap, batch: BatchConfig): Result<Uri> {
+        // 名字拍完时自动进入下一轮：命名与目录都要用"生效配置"，
+        // 否则会出现界面显示的下一张与实际存盘不一致
+        val effective = batch.effectiveForNextShot()
+        if (effective.round != batch.round) {
+            Log.d(TAG, "savePhoto: 本轮已拍完，自动进入第 ${effective.round} 轮")
+        }
+        return saveBitmap(bitmap, effective.nextFileName(), batchRelativePath(effective))
+    }
+
+    /**
      * 保存照片到相册（从字节数组）
+     *
+     * 默认命名：IMG_yyyyMMdd_HHmmss.jpg，存 Pictures/FilterCamera/
      */
     override suspend fun savePhoto(imageData: ByteArray, fileName: String): Result<Uri> =
-        withContext(Dispatchers.IO) {
-            try {
-                Log.d(TAG, "savePhoto: 开始保存照片(字节数组) fileName=$fileName, size=${imageData.size}")
-                val contentValues = createImageContentValues(fileName)
-                val uri = context.contentResolver.insert(
-                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    contentValues
-                ) ?: return@withContext Result.failure(Exception("创建媒体文件失败"))
+        saveImageBytes(imageData, "$fileName$PHOTO_EXTENSION", defaultRelativePath)
 
-                context.contentResolver.openOutputStream(uri)?.use { outputStream ->
-                    outputStream.write(imageData)
-                    Log.d(TAG, "savePhoto: 字节数据写入成功")
-                } ?: return@withContext Result.failure(Exception("打开输出流失败"))
-
-                // 更新IS_PENDING状态（Android 10+）
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    contentValues.clear()
-                    contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
-                    context.contentResolver.update(uri, contentValues, null, null)
-                }
-
-                _lastSavedMediaUri.value = uri
-                Log.d(TAG, "savePhoto: 照片保存成功 uri=$uri")
-                Result.success(uri)
-            } catch (e: Exception) {
-                Log.e(TAG, "savePhoto: 保存照片失败", e)
-                Result.failure(e)
-            }
+    /**
+     * 保存照片到指定批次（从字节数组）
+     *
+     * 相机拍照链路走的是字节数组版本（CameraX 先落临时文件再读字节）。
+     */
+    override suspend fun savePhoto(imageData: ByteArray, batch: BatchConfig): Result<Uri> {
+        val effective = batch.effectiveForNextShot()
+        if (effective.round != batch.round) {
+            Log.d(TAG, "savePhoto: 本轮已拍完，自动进入第 ${effective.round} 轮")
         }
+        return saveImageBytes(imageData, effective.nextFileName(), batchRelativePath(effective))
+    }
+
+    /**
+     * 保存到应用私有目录（不进系统相册）
+     *
+     * 对应「自动保存」关闭的情况。放在 filesDir 下而不是 cacheDir，
+     * 避免被系统在空间不足时清掉。
+     */
+    override suspend fun savePhotoToAppPrivate(
+        imageData: ByteArray,
+        fileName: String
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        try {
+            val dir = File(context.filesDir, PRIVATE_UNSAVED_DIR)
+            if (!dir.exists()) dir.mkdirs()
+
+            val file = File(dir, fileName)
+            file.outputStream().use { out -> out.write(imageData) }
+
+            Log.d(TAG, "savePhotoToAppPrivate: 已保存到私有目录 ${file.absolutePath}")
+            Result.success(Uri.fromFile(file))
+        } catch (e: Exception) {
+            Log.e(TAG, "savePhotoToAppPrivate: 保存失败", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 计算批次的相对保存目录
+     *
+     * @param batch 批次配置
+     * @return 如 "Pictures/BatchA" 或 "Pictures/BatchA/2026-09-16"
+     */
+    private fun batchRelativePath(batch: BatchConfig): String {
+        // 层级顺序由 BatchConfig.relativeSubPath 统一决定：目录 / 日期 / 轮次
+        // （日期在外、轮次在内，按天翻看时同一天的各轮次收在同一个日期目录下）
+        val dateStamp = if (batch.dateSubDir) {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        } else {
+            null
+        }
+        return "${Environment.DIRECTORY_PICTURES}/${batch.relativeSubPath(dateStamp)}"
+    }
+
+    /**
+     * 写入Bitmap到MediaStore（内部实现）
+     *
+     * @param bitmap 图像数据
+     * @param displayName 完整文件名（含扩展名）
+     * @param relativePath 相对路径，如 Pictures/BatchA
+     */
+    private suspend fun saveBitmap(
+        bitmap: Bitmap,
+        displayName: String,
+        relativePath: String
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "saveBitmap: 开始保存照片 displayName=$displayName, path=$relativePath")
+            val contentValues = buildImageContentValues(displayName, relativePath)
+            val uri = context.contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues
+            ) ?: return@withContext Result.failure(Exception("创建媒体文件失败"))
+
+            Log.d(TAG, "saveBitmap: 创建Uri成功 uri=$uri")
+
+            context.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, outputStream)
+                Log.d(TAG, "saveBitmap: 图像压缩写入成功")
+            } ?: return@withContext Result.failure(Exception("打开输出流失败"))
+
+            finishPendingInsert(uri, contentValues)
+
+            _lastSavedMediaUri.value = uri
+            Log.d(TAG, "saveBitmap: 照片保存成功 uri=$uri")
+            Result.success(uri)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveBitmap: 保存照片失败", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 写入JPEG字节到MediaStore（内部实现）
+     *
+     * @param imageData JPEG图像字节数据
+     * @param displayName 完整文件名（含扩展名）
+     * @param relativePath 相对路径，如 Pictures/BatchA
+     */
+    private suspend fun saveImageBytes(
+        imageData: ByteArray,
+        displayName: String,
+        relativePath: String
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        try {
+            Log.d(TAG, "saveImageBytes: 开始保存照片 displayName=$displayName, path=$relativePath, size=${imageData.size}")
+            val contentValues = buildImageContentValues(displayName, relativePath)
+            val uri = context.contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues
+            ) ?: return@withContext Result.failure(Exception("创建媒体文件失败"))
+
+            context.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                outputStream.write(imageData)
+                Log.d(TAG, "saveImageBytes: 字节数据写入成功")
+            } ?: return@withContext Result.failure(Exception("打开输出流失败"))
+
+            finishPendingInsert(uri, contentValues)
+
+            _lastSavedMediaUri.value = uri
+            Log.d(TAG, "saveImageBytes: 照片保存成功 uri=$uri")
+            Result.success(uri)
+        } catch (e: Exception) {
+            Log.e(TAG, "saveImageBytes: 保存照片失败", e)
+            Result.failure(e)
+        }
+    }
 
     /**
      * 保存视频到相册
@@ -182,6 +460,92 @@ class MediaRepositoryImpl @Inject constructor(
         }
 
     /**
+     * 查询指定目录下的照片（按拍摄时间升序，用于导出清单）
+     */
+    override suspend fun getPhotosInDir(relativePathHint: String): List<MediaFile> =
+        withContext(Dispatchers.IO) {
+            val result = mutableListOf<MediaFile>()
+            try {
+                val column = albumPathColumn
+                val projection = arrayOf(
+                    MediaStore.Images.Media._ID,
+                    MediaStore.Images.Media.DISPLAY_NAME,
+                    MediaStore.Images.Media.DATA,
+                    MediaStore.Images.Media.MIME_TYPE,
+                    MediaStore.Images.Media.SIZE,
+                    MediaStore.Images.Media.DATE_ADDED
+                )
+                context.contentResolver.query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    projection,
+                    "$column LIKE ?",
+                    arrayOf("%${relativePathHint.trim('/')}%"),
+                    "${MediaStore.Images.Media.DATE_ADDED} ASC"          // 清单按拍摄先后排列
+                )?.use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID))
+                        result.add(
+                            MediaFile(
+                                uri = Uri.withAppendedPath(
+                                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString()
+                                ),
+                                path = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)) ?: "",
+                                name = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)) ?: "",
+                                mimeType = cursor.getString(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.MIME_TYPE)) ?: "image/jpeg",
+                                size = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)),
+                                dateAdded = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)) * 1000
+                            )
+                        )
+                    }
+                }
+                Log.d(TAG, "getPhotosInDir: $relativePathHint -> ${result.size} 张")
+            } catch (e: Exception) {
+                Log.e(TAG, "getPhotosInDir: 查询失败", e)
+            }
+            result
+        }
+
+    /**
+     * 保存文本文件到「文档」目录（导出 CSV 清单用）
+     */
+    override suspend fun saveTextDocument(fileName: String, content: String): Result<Uri> =
+        withContext(Dispatchers.IO) {
+            try {
+                val bytes = content.toByteArray(Charsets.UTF_8)
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
+                    put(MediaStore.MediaColumns.DATE_ADDED, System.currentTimeMillis() / 1000)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS)
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    } else {
+                        val dir = File(
+                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                            ALBUM_NAME
+                        )
+                        if (!dir.exists()) dir.mkdirs()
+                        put(MediaStore.MediaColumns.DATA, File(dir, fileName).absolutePath)
+                    }
+                }
+
+                val uri = context.contentResolver.insert(
+                    MediaStore.Files.getContentUri("external"), values
+                ) ?: return@withContext Result.failure(Exception("创建文件失败"))
+
+                context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                    ?: return@withContext Result.failure(Exception("打开输出流失败"))
+
+                finishPendingInsert(uri, values)
+                Log.d(TAG, "saveTextDocument: 已导出 $fileName (${bytes.size} 字节) -> $uri")
+                Result.success(uri)
+            } catch (e: Exception) {
+                Log.e(TAG, "saveTextDocument: 导出失败", e)
+                Result.failure(e)
+            }
+        }
+
+    /**
      * 获取最近的媒体文件
      */
     override suspend fun getRecentMedia(limit: Int): List<MediaFile> =
@@ -200,11 +564,14 @@ class MediaRepositoryImpl @Inject constructor(
                     MediaStore.Images.Media.DATE_ADDED
                 )
 
+                // 相册范围：默认目录 + 所有批次目录
+                val (albumSelection, albumSelectionArgs) = buildAlbumSelection()
+
                 context.contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                     imageProjection,
-                    "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
-                    arrayOf("%$ALBUM_NAME%"),
+                    albumSelection,
+                    albumSelectionArgs,
                     "${MediaStore.Images.Media.DATE_ADDED} DESC"
                 )?.use { cursor ->
                     while (cursor.moveToNext() && mediaFiles.size < limit) {
@@ -237,6 +604,16 @@ class MediaRepositoryImpl @Inject constructor(
         withContext(Dispatchers.IO) {
             try {
                 Log.d(TAG, "deleteMedia: 删除媒体 uri=$uri")
+
+                // 私有目录的照片是 file:// 形式，ContentResolver 删不掉，直接删文件
+                if (uri.scheme == "file") {
+                    val file = uri.path?.let { File(it) }
+                    val ok = file?.exists() == true && file.delete()
+                    Log.d(TAG, "deleteMedia: 私有目录文件删除结果=$ok")
+                    return@withContext if (ok) Result.success(Unit)
+                    else Result.failure(Exception("删除失败"))
+                }
+
                 val deleted = context.contentResolver.delete(uri, null, null)
                 if (deleted > 0) {
                     Log.d(TAG, "deleteMedia: 删除成功")
@@ -352,15 +729,49 @@ class MediaRepositoryImpl @Inject constructor(
 
     /**
      * 创建图片ContentValues
+     *
+     * Android 10+：用 RELATIVE_PATH 指定相册目录（Scoped Storage，无需存储权限）
+     * Android 9及以下：没有 RELATIVE_PATH 列，必须用 DATA 绝对路径
+     *
+     * @param displayName 完整文件名（含扩展名），如 BA_001.jpg
+     * @param relativePath 相对路径，如 Pictures/BatchA
      */
-    private fun createImageContentValues(fileName: String): ContentValues {
+    private fun buildImageContentValues(displayName: String, relativePath: String): ContentValues {
         return ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, "$fileName$PHOTO_EXTENSION")
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.DATE_ADDED, System.currentTimeMillis() / 1000)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/$ALBUM_NAME")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)   // API 29+
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            } else {
+                put(MediaStore.MediaColumns.DATA, buildLegacyAbsolutePath(relativePath, displayName))
             }
+        }
+    }
+
+    /**
+     * 构造 Android 9及以下的绝对路径，并确保目录已创建
+     *
+     * 旧版本 MediaStore 只认 DATA 列，不建目录会导致 insert 失败或落到默认目录。
+     */
+    @Suppress("DEPRECATION")
+    private fun buildLegacyAbsolutePath(relativePath: String, displayName: String): String {
+        val dir = File(Environment.getExternalStorageDirectory(), relativePath)
+        if (!dir.exists()) {
+            dir.mkdirs()
+        }
+        return File(dir, displayName).absolutePath
+    }
+
+    /**
+     * 结束 IS_PENDING 状态（Android 10+），让文件对其它应用可见
+     */
+    private fun finishPendingInsert(uri: Uri, contentValues: ContentValues) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            contentValues.clear()
+            contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            context.contentResolver.update(uri, contentValues, null, null)
         }
     }
 
@@ -450,15 +861,15 @@ class MediaRepositoryImpl @Inject constructor(
             MediaStore.Images.Media.HEIGHT
         )
 
-        val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf("%$ALBUM_NAME%")
+        // 相册范围：默认目录 + 所有批次目录
+        val (albumSelection, albumSelectionArgs) = buildAlbumSelection()
         val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
 
         context.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             projection,
-            selection,
-            selectionArgs,
+            albumSelection,
+            albumSelectionArgs,
             sortOrder
         )?.use { cursor ->
             var skipped = 0                                                    // 已跳过数量
@@ -493,6 +904,34 @@ class MediaRepositoryImpl @Inject constructor(
             }
             Log.d(TAG, "queryImages: 查询到 $added 张图片")
         }
+
+        // 「自动保存」关闭时拍的照片落在应用私有目录，系统相册看不到；
+        // 这里把它们一并纳入，否则那些照片在 App 里也是黑洞。
+        result.addAll(listPrivateShots())
+    }
+
+    /**
+     * 列出应用私有目录里的照片（未写入系统相册的那些）
+     */
+    private fun listPrivateShots(): List<MediaFile> {
+        val dir = File(context.filesDir, PRIVATE_UNSAVED_DIR)
+        if (!dir.isDirectory) return emptyList()
+
+        return dir.listFiles()
+            ?.filter { it.isFile && it.length() > 0 }
+            ?.sortedByDescending { it.lastModified() }
+            ?.map { file ->
+                MediaFile(
+                    uri = Uri.fromFile(file),
+                    path = file.absolutePath,
+                    name = file.name,
+                    mimeType = "image/jpeg",
+                    size = file.length(),
+                    dateAdded = file.lastModified(),
+                    isVideo = false
+                )
+            }
+            ?: emptyList()
     }
 
     /**
@@ -519,15 +958,15 @@ class MediaRepositoryImpl @Inject constructor(
             MediaStore.Video.Media.DURATION
         )
 
-        val selection = "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf("%$ALBUM_NAME%")
+        // 相册范围：默认目录 + 所有批次目录
+        val (albumSelection, albumSelectionArgs) = buildAlbumSelection()
         val sortOrder = "${MediaStore.Video.Media.DATE_ADDED} DESC"
 
         context.contentResolver.query(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             projection,
-            selection,
-            selectionArgs,
+            albumSelection,
+            albumSelectionArgs,
             sortOrder
         )?.use { cursor ->
             var skipped = 0                                                    // 已跳过数量
@@ -566,14 +1005,13 @@ class MediaRepositoryImpl @Inject constructor(
      * 获取图片总数（内部方法）
      */
     private fun getImageCount(): Int {
-        val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf("%$ALBUM_NAME%")
+        val (albumSelection, albumSelectionArgs) = buildAlbumSelection()
 
         return context.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             arrayOf(MediaStore.Images.Media._ID),
-            selection,
-            selectionArgs,
+            albumSelection,
+            albumSelectionArgs,
             null
         )?.use { it.count } ?: 0
     }
@@ -582,14 +1020,13 @@ class MediaRepositoryImpl @Inject constructor(
      * 获取视频总数（内部方法）
      */
     private fun getVideoCount(): Int {
-        val selection = "${MediaStore.Video.Media.RELATIVE_PATH} LIKE ?"
-        val selectionArgs = arrayOf("%$ALBUM_NAME%")
+        val (albumSelection, albumSelectionArgs) = buildAlbumSelection()
 
         return context.contentResolver.query(
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             arrayOf(MediaStore.Video.Media._ID),
-            selection,
-            selectionArgs,
+            albumSelection,
+            albumSelectionArgs,
             null
         )?.use { it.count } ?: 0
     }

@@ -115,6 +115,14 @@ class PortraitBlurProcessor @Inject constructor(
     // 处理互斥锁，确保线程安全
     private val processingMutex = Mutex()
 
+    /**
+     * 分割输入的最长边上限
+     *
+     * ML Kit 自拍分割模型的输出蒙版本身就是低分辨率，输入几百像素已经足够，
+     * 喂 1200 万像素只会拖慢速度。
+     */
+    private val segmentationMaxSize = 640
+
     // ML Kit Selfie Segmenter 实例
     private var segmenter: Segmenter? = null
 
@@ -219,11 +227,22 @@ class PortraitBlurProcessor @Inject constructor(
                 Log.d(TAG, "processPortraitBlur: 开始人物分割")
                 val segmentStartTime = System.currentTimeMillis()
 
-                val inputImage = InputImage.fromBitmap(sourceBitmap, 0)
+                // 分割用降采样副本：
+                // ML Kit 的分割模型本身只在很小的分辨率上工作，输出蒙版也是低分辨率，
+                // 直接喂原图（这里常是 3072x4096）等于白白搬运 1200 万像素，
+                // 实测这一步占了人像虚化总耗时的大头。降采样对最终效果没有影响
+                // （蒙版最后仍会按原图尺寸拉伸合成）。
+                val segmentationInput = createSegmentationInput(sourceBitmap)
+                val inputImage = InputImage.fromBitmap(segmentationInput, 0)
 
                 // 使用超时机制，防止ML Kit在模拟器上无限等待
                 val segmentationMask = withTimeoutOrNull(10000L) {  // 10秒超时
                     segmentImage(segmenterInstance, inputImage)
+                }
+
+                // 分割输入是一次性副本，用完立刻回收
+                if (segmentationInput !== sourceBitmap && !segmentationInput.isRecycled) {
+                    segmentationInput.recycle()
                 }
 
                 // 如果超时或分割失败，返回原图
@@ -424,6 +443,31 @@ class PortraitBlurProcessor @Inject constructor(
      * @param inputImage 输入图像
      * @return 分割蒙版
      */
+    /**
+     * 生成用于 ML Kit 分割的降采样输入
+     *
+     * 超过 [segmentationMaxSize] 的长边会被等比缩小；小图原样返回，避免无谓拷贝。
+     * 调用方负责回收返回的副本（返回原图本身时不要回收）。
+     */
+    private fun createSegmentationInput(source: Bitmap): Bitmap {
+        val longSide = maxOf(source.width, source.height)
+        if (longSide <= segmentationMaxSize) {
+            return source
+        }
+
+        val scale = segmentationMaxSize.toFloat() / longSide
+        val targetWidth = (source.width * scale).toInt().coerceAtLeast(1)
+        val targetHeight = (source.height * scale).toInt().coerceAtLeast(1)
+
+        val scaled = Bitmap.createScaledBitmap(source, targetWidth, targetHeight, true)
+        Log.d(
+            TAG,
+            "createSegmentationInput: 分割输入降采样 ${source.width}x${source.height} -> " +
+                "${scaled.width}x${scaled.height}"
+        )
+        return scaled
+    }
+
     private suspend fun segmentImage(
         segmenter: Segmenter,
         inputImage: InputImage

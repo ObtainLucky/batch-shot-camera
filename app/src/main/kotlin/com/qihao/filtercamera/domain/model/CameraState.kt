@@ -214,5 +214,6 @@ sealed class CameraEvent {
     data class PhotoCaptured(val filePath: String) : CameraEvent()        // 拍照完成
     data class VideoRecorded(val filePath: String) : CameraEvent()        // 录像完成
     data class Error(val message: String) : CameraEvent()                 // 错误事件
+    data class Info(val message: String) : CameraEvent()                  // 提示事件（非错误，如批次创建成功）
     data object CameraSwitched : CameraEvent()                            // 镜头切换完成
 }

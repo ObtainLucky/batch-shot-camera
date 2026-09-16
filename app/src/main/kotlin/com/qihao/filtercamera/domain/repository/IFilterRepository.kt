@@ -83,6 +83,17 @@ interface IFilterRepository {
     fun applyFilterToBitmapSync(filterType: FilterType, sourceBitmap: Bitmap): Bitmap?
 
     /**
+     * 设置页的「信息水印」开关是否打开
+     *
+     * 信息水印是独立于滤镜选择的叠加效果：开关打开时，即使当前滤镜是"原图"
+     * （FilterType.NONE）也要叠加。因此拍照与预览链路在"无滤镜"的快捷分支里，
+     * 需要先问一下这里，不能直接跳过。
+     *
+     * @return true 表示需要叠加信息水印
+     */
+    fun isInfoWatermarkEnabled(): Boolean
+
+    /**
      * 初始化滤镜引擎
      * @param width 渲染宽度
      * @param height 渲染高度

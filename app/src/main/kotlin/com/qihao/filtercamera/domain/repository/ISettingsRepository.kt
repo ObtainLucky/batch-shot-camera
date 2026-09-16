@@ -21,6 +21,7 @@
 package com.qihao.filtercamera.domain.repository
 
 import com.qihao.filtercamera.domain.model.FilterType
+import com.qihao.filtercamera.domain.model.WatermarkField
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -170,6 +171,32 @@ interface ISettingsRepository {
      * @param text 水印文字
      */
     suspend fun setWatermarkText(text: String)
+
+    /**
+     * 获取信息水印要显示的字段集合
+     *
+     * 实时字段（经纬度/地址/时间/天气）只能开关，备注既能开关也能改内容。
+     * @return 启用的字段集合 Flow
+     */
+    fun getWatermarkFields(): Flow<Set<WatermarkField>>
+
+    /**
+     * 设置信息水印要显示的字段集合
+     * @param fields 启用的字段集合
+     */
+    suspend fun setWatermarkFields(fields: Set<WatermarkField>)
+
+    /**
+     * 获取水印大小倍率（1.0 为基准）
+     * @return 倍率 Flow
+     */
+    fun getWatermarkSizeScale(): Flow<Float>
+
+    /**
+     * 设置水印大小倍率
+     * @param scale 倍率，建议 0.5~2.0
+     */
+    suspend fun setWatermarkSizeScale(scale: Float)
 
     // ==================== 保存位置设置 ====================
 

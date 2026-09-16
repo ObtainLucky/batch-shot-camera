@@ -73,7 +73,10 @@ import com.qihao.filtercamera.domain.model.PortraitBlurLevel
 import com.qihao.filtercamera.domain.model.TimelapseSettings
 import com.qihao.filtercamera.domain.model.AspectRatio
 import com.qihao.filtercamera.domain.model.WhiteBalanceMode
+import com.qihao.filtercamera.di.ApplicationScope
 import com.qihao.filtercamera.domain.repository.ICameraRepository
+import com.qihao.filtercamera.domain.repository.ISettingsRepository
+import com.qihao.filtercamera.domain.repository.VideoQuality
 import com.qihao.filtercamera.domain.repository.IFilterRepository
 import com.qihao.filtercamera.domain.repository.ZoomRange
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -81,7 +84,10 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -111,7 +117,9 @@ class CameraRepositoryImpl @Inject constructor(
     private val hdrProcessor: HdrProcessor,                                       // HDR处理器
     private val nightModeProcessor: NightModeProcessor,                           // 夜景模式处理器
     private val timelapseEngine: TimelapseEngine,                                 // 延时摄影引擎
-    private val portraitBlurProcessor: PortraitBlurProcessor                      // 人像虚化处理器
+    private val portraitBlurProcessor: PortraitBlurProcessor,                     // 人像虚化处理器
+    private val settingsRepository: ISettingsRepository,                           // 设置仓库（照片质量）
+    @ApplicationScope private val applicationScope: CoroutineScope                 // 应用级作用域（监听设置）
 ) : ICameraRepository {
 
     companion object {
@@ -120,10 +128,145 @@ class CameraRepositoryImpl @Inject constructor(
         private const val ANALYSIS_HEIGHT = 720                           // 分析帧高度
         private const val FRAME_BUFFER_CAPACITY = 3                       // 帧缓冲区容量
         private const val FRAME_PROCESSING_INTERVAL_MS = 33L              // 帧处理间隔（约30fps）
+
+        /**
+         * 无滤镜时是否仍需要走一趟滤镜链路
+         *
+         * 信息水印是**独立于滤镜选择**的叠加效果，它的绘制在滤镜链路内部
+         * （FilterRepository.applyFilterInternal）。所以当设置里打开了信息水印时，
+         * 即使当前滤镜是"原图"，拍照与预览也**不能**走"跳过滤镜"的快捷分支，
+         * 否则用户开着水印却拍不到水印（这个坑真实出现过一次）。
+         *
+         * @param filterType 当前滤镜
+         * @param infoWatermarkEnabled 设置里的信息水印开关
+         * @return true 表示必须继续调用滤镜链路
+         */
+        internal fun needsFilterPipeline(
+            filterType: FilterType,
+            infoWatermarkEnabled: Boolean
+        ): Boolean = filterType != FilterType.NONE || infoWatermarkEnabled
+
+        /**
+         * 是否值得把分析帧转换成 Bitmap
+         *
+         * 分析帧的 YUV→Bitmap 走的是「NV21 → JPEG 编码 → JPEG 解码」这条重路径，
+         * 按 30fps 算每秒要跑 60 次 JPEG 编解码。而默认状态下（没选滤镜、没开信息水印、
+         * 没开美颜与虚化）转换出来的位图**根本不会被使用**，白白把 CPU 占满，
+         * 反过来拖慢拍照链路。
+         *
+         * 所以这里先判断"有没有消费者"，没有就直接丢弃这一帧。
+         *
+         * @param filterType 当前滤镜
+         * @param infoWatermarkEnabled 信息水印开关
+         * @param beautyIntensity 美颜强度
+         * @param portraitBlurActive 人像虚化是否开启
+         * @param hasRawFrame 是否已经抓到过原始预览帧（滤镜缩略图需要它）
+         * @return true 表示需要转换
+         */
+        internal fun needsAnalysisBitmap(
+            filterType: FilterType,
+            infoWatermarkEnabled: Boolean,
+            beautyIntensity: Float,
+            portraitBlurActive: Boolean,
+            hasRawFrame: Boolean
+        ): Boolean {
+            if (needsFilterPipeline(filterType, infoWatermarkEnabled)) return true
+            if (beautyIntensity > 0f) return true
+            if (portraitBlurActive) return true
+            // 还没抓到原始帧时先转一帧，否则滤镜缩略图会没素材
+            if (!hasRawFrame) return true
+            return false
+        }
     }
 
-    // 相机执行器
+    /**
+     * 观察设置里的视频质量
+     */
+    private fun observeVideoQuality() {
+        applicationScope.launch {
+            settingsRepository.getVideoQuality()
+                .catch { e -> Log.w(TAG, "observeVideoQuality: 读取失败", e) }
+                .collect { quality ->
+                    val changed = videoQuality != quality
+                    videoQuality = quality
+                    Log.d(TAG, "observeVideoQuality: 录像质量=${quality.displayName}, 变化=$changed")
+                    if (changed && camera != null) {
+                        // Recorder 在绑定时被固化进 VideoCapture，改设置后必须重绑才生效，
+                        // 否则用户改了设置却看不到任何变化，会以为功能坏了。
+                        rebindForVideoQualityChange()
+                    }
+                }
+        }
+    }
+
+    /**
+     * 因录像质量变化而重绑相机
+     *
+     * 重新构建用例并绑定，让新的 Recorder 生效。
+     * 失败只记日志：重绑失败不该让当前预览挂掉（旧用例仍可用）。
+     */
+    private suspend fun rebindForVideoQualityChange() {
+        val owner = lifecycleOwner ?: return
+        val provider = runCatching { getCameraProvider() }.getOrNull() ?: return
+        val previewView = previewViewRef ?: return
+
+        try {
+            Log.d(TAG, "rebindForVideoQualityChange: 重新绑定以应用新的录像质量")
+            provider.unbindAll()
+            buildUseCases(UseCaseConfig(aspectRatio = currentAspectRatio.cameraXRatio, previewView = previewView))
+            bindUseCasesToLifecycle(owner, provider, getCameraSelector(_currentLens.value))
+            Log.d(TAG, "rebindForVideoQualityChange: 重绑完成")
+        } catch (e: Exception) {
+            Log.e(TAG, "rebindForVideoQualityChange: 重绑失败，仍使用原配置", e)
+        }
+    }
+
+    /**
+     * 视频质量档位映射到 CameraX 的 Quality
+     */
+    private fun VideoQuality.toCameraXQuality(): Quality = when (this) {
+        VideoQuality.QUALITY_4K -> Quality.UHD
+        VideoQuality.QUALITY_1080P -> Quality.FHD
+        VideoQuality.QUALITY_720P -> Quality.HD
+    }
+
+    /**
+     * 观察设置里的照片质量
+     *
+     * 拍照编码在后台线程执行，这里用 volatile 字段同步，避免每张照片都去读 DataStore。
+     */
+    private fun observePhotoQuality() {
+        applicationScope.launch {
+            settingsRepository.getPhotoQuality()
+                .catch { e -> Log.w(TAG, "observePhotoQuality: 读取失败", e) }
+                .collect { quality ->
+                    jpegQuality = quality.compressionQuality
+                    Log.d(TAG, "observePhotoQuality: JPEG 质量=$jpegQuality (${quality.displayName})")
+                }
+        }
+    }
+
+    /**
+     * 录像分辨率档位
+     *
+     * 跟随设置页的「视频质量」。此前写死 Quality.HIGHEST，设置改了没反应。
+     * 注意：Recorder 在绑定相机时构建，所以改动在**下次进入相机页（重新绑定）后**生效。
+     */
+    @Volatile
+    private var videoQuality: VideoQuality = VideoQuality.QUALITY_1080P
+
+    // 相机执行器（ImageAnalysis 的分析线程）
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /**
+     * 拍照专用执行器
+     *
+     * 拍照回调**不能**和 ImageAnalysis 共用同一条单线程执行器：
+     * 分析线程被实时预览帧占满时，onCaptureSuccess 会排在这些帧后面才被投递，
+     * 表现为"按下快门后要等一会儿才有反应"。拍照回调本身只做一件事（把结果
+     * 交给协程），单独给一条线程即可。
+     */
+    private val captureExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     // 异步帧处理器（解决帧处理阻塞问题）
     private val frameProcessor = FrameProcessor(
@@ -228,14 +371,18 @@ class CameraRepositoryImpl @Inject constructor(
 
         // 创建拍照用例
         imageCapture = ImageCapture.Builder().apply {
-            setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+            // 用 MINIMIZE_LATENCY 而不是 MAXIMIZE_QUALITY：
+            // 后者是 CameraX 明确的"拿快门延迟换画质"模式，批次连续拍摄时体感很差。
+            // 如果更在意单张画质，把下面这行换回 CAPTURE_MODE_MAXIMIZE_QUALITY 即可。
+            setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             resolutionSelector?.let { setResolutionSelector(it) }
         }.build()
 
-        // 创建录像用例
+        // 创建录像用例（分辨率跟随设置页的「视频质量」）
         val recorder = Recorder.Builder()
-            .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+            .setQualitySelector(QualitySelector.from(videoQuality.toCameraXQuality()))
             .build()
+        Log.d(TAG, "buildUseCases: 录像质量=${videoQuality.displayName} (${videoQuality.resolution})")
         videoCapture = VideoCapture.withOutput(recorder)
 
         // 创建图像分析用例（用于实时滤镜预览）
@@ -390,6 +537,24 @@ class CameraRepositoryImpl @Inject constructor(
     private fun processImageForFilter(imageProxy: ImageProxy) {
         val startTime = System.nanoTime()
         try {
+            // 没有任何需要渲染的效果、且已抓到过原始帧时，直接丢弃这一帧。
+            // 这一步很重要：分析帧的 YUV→Bitmap 要经过 JPEG 编码+解码，
+            // 30fps 下每秒 60 次编解码，白跑起来会把 CPU 占满并拖慢拍照。
+            val needed = needsAnalysisBitmap(
+                filterType = currentFilterType,
+                infoWatermarkEnabled = filterRepository.isInfoWatermarkEnabled(),
+                beautyIntensity = beautyIntensity,
+                portraitBlurActive = currentPortraitBlurLevel != PortraitBlurLevel.NONE,
+                hasRawFrame = _rawPreviewFrame.value != null
+            )
+            if (!needed) {
+                // 清掉可能残留的滤镜预览层，避免关掉效果后画面停在旧帧上
+                if (_filteredFrame.value != null) {
+                    _filteredFrame.value = null
+                }
+                return
+            }
+
             // 将YUV转换为Bitmap（快速转换）
             val bitmap = yuvImageProxyToBitmap(imageProxy)
             if (bitmap == null) {
@@ -400,9 +565,9 @@ class CameraRepositoryImpl @Inject constructor(
             // 提交帧到异步处理器（非阻塞）
             frameProcessor.submitFrame(bitmap)
 
-            // 性能日志（每100帧输出一次）
+            // 性能日志：转换耗时超过 50ms 视为异常
             val conversionTimeNs = System.nanoTime() - startTime
-            if (conversionTimeNs > 50_000_000) {  // 超过50ms警告
+            if (conversionTimeNs > 50_000_000) {
                 Log.w(TAG, "processImageForFilter: 帧转换耗时过长 ${conversionTimeNs / 1_000_000}ms")
             }
         } catch (e: Exception) {
@@ -462,8 +627,9 @@ class CameraRepositoryImpl @Inject constructor(
                 bitmap
             }
 
-            // Step 2: 如果无滤镜但有美颜，直接显示美颜效果
-            if (filterType == FilterType.NONE) {
+            // Step 2: 无滤镜且没有额外叠加效果时走快捷分支（省掉每帧一次位图处理）
+            // 信息水印属于"额外叠加效果"，开着就必须继续走到滤镜链路去画它。
+            if (!needsFilterPipeline(filterType, filterRepository.isInfoWatermarkEnabled())) {
                 if (intensity > 0f && beautifiedBitmap !== bitmap) {
                     _filteredFrame.value = beautifiedBitmap                         // 显示美颜效果
                     return beautifiedBitmap
@@ -575,12 +741,14 @@ class CameraRepositoryImpl @Inject constructor(
         )
 
         try {
+            val totalStart = System.currentTimeMillis()
+            var stageStart = totalStart
             Log.d(TAG, "takePhoto: 开始拍照 hdrMode=${currentHdrMode.displayName}")
 
             // 捕获图像并获取ImageProxy
             val imageProxy = suspendCancellableCoroutine<ImageProxy> { continuation ->
                 capture.takePicture(
-                    cameraExecutor,
+                    captureExecutor,
                     object : ImageCapture.OnImageCapturedCallback() {
                         override fun onCaptureSuccess(image: ImageProxy) {
                             Log.d(TAG, "takePhoto: 图像捕获成功 size=${image.width}x${image.height}")
@@ -595,6 +763,29 @@ class CameraRepositoryImpl @Inject constructor(
                 )
             }
 
+            // 耗时打点：等待相机出图
+            val captureWaitMs = System.currentTimeMillis() - stageStart
+            stageStart = System.currentTimeMillis()
+            Log.d(TAG, "takePhoto: [耗时] 等待相机捕获=${captureWaitMs}ms")
+
+            // ==================== 直存快速通道 ====================
+            // 没有任何需要按像素处理的效果时，直接把相机吐出的 JPEG 原样落盘：
+            // 省掉"解码成位图 -> 再编码"这一整轮（实测约 250ms/张）。
+            // 旋转信息保留在 JPEG 的 EXIF 里（相册与编辑器都会遵守，这也是相机应用的通行做法）。
+            if (canPassThroughOriginalJpeg()) {
+                val passthroughFile = writeOriginalJpegToTempFile(imageProxy)
+                imageProxy.close()
+                if (passthroughFile != null) {
+                    Log.d(
+                        TAG,
+                        "takePhoto: [耗时] 直存原始 JPEG，跳过解码与重编码 " +
+                            "总计=${System.currentTimeMillis() - totalStart}ms"
+                    )
+                    return@withContext Result.success(passthroughFile.absolutePath)
+                }
+                Log.w(TAG, "takePhoto: 直存失败，回退到常规处理链路")
+            }
+
             // 将ImageProxy转换为Bitmap
             var originalBitmap = imageProxyToBitmap(imageProxy)
             imageProxy.close()                                                    // 释放ImageProxy
@@ -604,7 +795,13 @@ class CameraRepositoryImpl @Inject constructor(
                 return@withContext Result.failure(Exception("Bitmap转换失败"))
             }
 
-            Log.d(TAG, "takePhoto: 原始Bitmap大小 ${originalBitmap.width}x${originalBitmap.height}")
+            val convertMs = System.currentTimeMillis() - stageStart
+            stageStart = System.currentTimeMillis()
+            Log.d(
+                TAG,
+                "takePhoto: [耗时] 解码+旋转=${convertMs}ms, 原始Bitmap大小 " +
+                    "${originalBitmap.width}x${originalBitmap.height}"
+            )
 
             // ==================== HDR处理 ====================
             // 判断是否需要软件HDR处理
@@ -665,14 +862,25 @@ class CameraRepositoryImpl @Inject constructor(
             val currentFilter = filterRepository.getCurrentFilter().first()
             Log.d(TAG, "takePhoto: 当前滤镜=$currentFilter")
 
-            val filteredBitmap = if (currentFilter != FilterType.NONE) {
-                Log.d(TAG, "takePhoto: 正在应用滤镜...")
-                filterRepository.applyFilterToBitmap(currentFilter, nightProcessedBitmap) ?: nightProcessedBitmap
+            // 注意：无滤镜时也要看信息水印开关 —— 水印是在滤镜链路内部叠加的，
+            // 跳过这一步水印就不会出现在照片上（见 needsFilterPipeline 的说明）。
+            val filteredBitmap = if (
+                needsFilterPipeline(currentFilter, filterRepository.isInfoWatermarkEnabled())
+            ) {
+                Log.d(TAG, "takePhoto: 正在应用滤镜/水印...")
+                filterRepository.applyFilterToBitmap(currentFilter, nightProcessedBitmap)
+                    ?: nightProcessedBitmap
             } else {
                 nightProcessedBitmap
             }
 
-            Log.d(TAG, "takePhoto: 滤镜处理完成 大小=${filteredBitmap.width}x${filteredBitmap.height}")
+            val filterMs = System.currentTimeMillis() - stageStart
+            stageStart = System.currentTimeMillis()
+            Log.d(
+                TAG,
+                "takePhoto: [耗时] 滤镜/水印=${filterMs}ms, 结果大小 " +
+                    "${filteredBitmap.width}x${filteredBitmap.height}"
+            )
 
             // ==================== 美颜处理 ====================
             val beautifiedBitmap = if (beautyIntensity > 0f) {
@@ -696,6 +904,7 @@ class CameraRepositoryImpl @Inject constructor(
 
             // ==================== 人像虚化处理 ====================
             // 判断是否需要人像虚化处理（虚化等级不为NONE）
+            val beforePortraitMs = System.currentTimeMillis()
             val finalBitmap = if (currentPortraitBlurLevel != PortraitBlurLevel.NONE) {
                 Log.d(TAG, "takePhoto: 正在应用人像虚化 level=$currentPortraitBlurLevel")
                 val portraitStartTime = System.currentTimeMillis()
@@ -711,14 +920,26 @@ class CameraRepositoryImpl @Inject constructor(
                 beautifiedBitmap
             }
 
-            Log.d(TAG, "takePhoto: 最终图片大小=${finalBitmap.width}x${finalBitmap.height}")
+            val portraitMs = System.currentTimeMillis() - beforePortraitMs
+            Log.d(
+                TAG,
+                "takePhoto: [耗时] 人像虚化=${portraitMs}ms, 最终图片大小=${finalBitmap.width}x${finalBitmap.height}"
+            )
 
             // ==================== 保存文件 ====================
             val photoFile = createTempPhotoFile()
             FileOutputStream(photoFile).use { fos ->
-                finalBitmap.compress(Bitmap.CompressFormat.JPEG, 95, fos)      // 95%质量压缩
+                finalBitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, fos)   // 质量跟随设置
             }
 
+            val encodeMs = System.currentTimeMillis() - stageStart
+            val totalMs = System.currentTimeMillis() - totalStart
+            Log.d(
+                TAG,
+                "takePhoto: [耗时] JPEG编码+写临时文件=${encodeMs}ms, " +
+                    "总计=${totalMs}ms（捕获=${captureWaitMs} + 解码旋转=${convertMs} + " +
+                    "滤镜水印=${filterMs} + 人像虚化=${portraitMs} + 编码=${encodeMs - portraitMs}）"
+            )
             Log.d(TAG, "takePhoto: 照片保存成功 path=${photoFile.absolutePath}")
 
             // 回收中间Bitmap
@@ -778,6 +999,46 @@ class CameraRepositoryImpl @Inject constructor(
             CameraLens.FRONT -> CameraSelector.LENS_FACING_FRONT
         }
         return nightModeProcessor.isHardwareNightAvailable(lensFacing)
+    }
+
+    /**
+     * 是否可以把相机原始 JPEG 直接落盘（跳过解码与重编码）
+     *
+     * 条件很严格：没有任何按像素生效的效果，且不是前置摄像头
+     * （前置通常需要镜像，那必须改像素）。
+     */
+    private fun canPassThroughOriginalJpeg(): Boolean {
+        if (currentFilterType != FilterType.NONE) return false                 // 选了滤镜
+        if (filterRepository.isInfoWatermarkEnabled()) return false            // 开了信息水印
+        if (beautyIntensity > 0f) return false                                // 美颜
+        if (currentPortraitBlurLevel != PortraitBlurLevel.NONE) return false  // 人像虚化
+        if (currentHdrMode == HdrMode.ON || currentHdrMode == HdrMode.AUTO) return false
+        if (currentNightMode == NightMode.ON || currentNightMode == NightMode.AUTO) return false
+        if (_currentLens.value == CameraLens.FRONT) return false              // 前置可能需要镜像
+        return true
+    }
+
+    /**
+     * 把原始 JPEG 字节写入临时文件
+     *
+     * @return 写入的文件，失败返回 null（调用方回退常规链路）
+     */
+    private fun writeOriginalJpegToTempFile(imageProxy: ImageProxy): File? {
+        return try {
+            if (imageProxy.format != android.graphics.ImageFormat.JPEG) {
+                Log.d(TAG, "writeOriginalJpegToTempFile: 不是 JPEG 格式(${imageProxy.format})，放弃直存")
+                return null
+            }
+            val bytes = ByteArray(imageProxy.planes[0].buffer.remaining())
+            imageProxy.planes[0].buffer.get(bytes)
+            val file = createTempPhotoFile()
+            FileOutputStream(file).use { it.write(bytes) }
+            Log.d(TAG, "writeOriginalJpegToTempFile: 直存 ${bytes.size / 1024}KB 原始 JPEG")
+            file
+        } catch (e: Exception) {
+            Log.w(TAG, "writeOriginalJpegToTempFile: 直存失败", e)
+            null
+        }
     }
 
     /**
@@ -1439,6 +1700,7 @@ class CameraRepositoryImpl @Inject constructor(
 
             // 关闭执行器
             cameraExecutor.shutdown()
+            captureExecutor.shutdown()
 
             // 输出帧处理器最终统计
             val stats = frameProcessor.getStatistics()
@@ -2068,7 +2330,30 @@ class CameraRepositoryImpl @Inject constructor(
     // ==================== 延时摄影实现 ====================
 
     // 当前人像虚化等级
-    private var currentPortraitBlurLevel = PortraitBlurLevel.MEDIUM
+    /**
+     * 当前人像虚化等级
+     *
+     * 默认必须是 NONE：虚化要跑一遍 ML Kit 人像分割，1200 万像素下单张约 5 秒。
+     * 只有进入人像模式后由 CameraViewModel 显式设置等级，普通拍照模式不该承担这个开销
+     * （而且会莫名其妙把照片虚化掉）。
+     */
+    private var currentPortraitBlurLevel = PortraitBlurLevel.NONE
+
+    /**
+     * 拍照 JPEG 压缩质量
+     *
+     * 跟随设置页的「照片质量」（高=95 / 标准=85 / 省空间=70）。
+     * 此前这里写死 95，设置改了完全没反应。
+     */
+    @Volatile
+    private var jpegQuality: Int = 95
+
+    init {
+        // 放在字段声明之后：Kotlin 按声明顺序初始化，
+        // init 里启动的观察若早于字段初始化，读到的值会被随后的初始化覆盖。
+        observePhotoQuality()
+        observeVideoQuality()
+    }
 
     /**
      * 开始延时摄影录制

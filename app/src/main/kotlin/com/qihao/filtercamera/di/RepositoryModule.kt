@@ -9,11 +9,13 @@
  */
 package com.qihao.filtercamera.di
 
+import com.qihao.filtercamera.data.repository.BatchRepositoryImpl
 import com.qihao.filtercamera.data.repository.CameraRepositoryImpl
 import com.qihao.filtercamera.data.repository.FavoritesRepositoryImpl
 import com.qihao.filtercamera.data.repository.FilterRepositoryImpl
 import com.qihao.filtercamera.data.repository.MediaRepositoryImpl
 import com.qihao.filtercamera.data.repository.SettingsRepositoryImpl
+import com.qihao.filtercamera.domain.repository.IBatchRepository
 import com.qihao.filtercamera.domain.repository.ICameraRepository
 import com.qihao.filtercamera.domain.repository.IFavoritesRepository
 import com.qihao.filtercamera.domain.repository.IFilterRepository
@@ -76,4 +78,13 @@ abstract class RepositoryModule {
     abstract fun bindFavoritesRepository(
         impl: FavoritesRepositoryImpl
     ): IFavoritesRepository
+
+    /**
+     * 绑定批次仓库（批次拍摄）
+     */
+    @Binds
+    @Singleton
+    abstract fun bindBatchRepository(
+        impl: BatchRepositoryImpl
+    ): IBatchRepository
 }
