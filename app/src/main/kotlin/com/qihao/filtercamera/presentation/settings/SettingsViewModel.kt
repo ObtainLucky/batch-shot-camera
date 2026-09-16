@@ -19,6 +19,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.qihao.filtercamera.domain.model.FilterType
+import com.qihao.filtercamera.domain.model.WatermarkField
 import com.qihao.filtercamera.domain.repository.GridType
 import com.qihao.filtercamera.domain.repository.ISettingsRepository
 import com.qihao.filtercamera.domain.repository.PhotoQuality
@@ -41,7 +42,9 @@ import javax.inject.Inject
  * @param gridType 网格类型
  * @param locationEnabled 位置信息开关
  * @param watermarkEnabled 水印开关
- * @param watermarkText 自定义水印文字
+ * @param watermarkText 备注文字
+ * @param watermarkFields 信息水印启用的字段集合
+ * @param watermarkSizeScale 水印大小倍率（1.0 为基准）
  * @param saveLocation 保存位置
  * @param customSavePath 自定义保存路径
  * @param defaultFilter 默认滤镜
@@ -60,7 +63,9 @@ data class SettingsUiState(
     val gridType: GridType = GridType.RULE_OF_THIRDS,                     // 网格类型
     val locationEnabled: Boolean = false,                                 // 位置信息开关
     val watermarkEnabled: Boolean = false,                                // 水印开关
-    val watermarkText: String = "FilterCamera",                           // 自定义水印文字
+    val watermarkText: String = "FilterCamera",                           // 备注文字
+    val watermarkFields: Set<WatermarkField> = WatermarkField.DEFAULT,     // 信息水印启用的字段
+    val watermarkSizeScale: Float = 1.0f,                                  // 水印大小倍率（1.0 为基准）
     val saveLocation: SaveLocation = SaveLocation.DCIM,                   // 保存位置
     val customSavePath: String = "",                                      // 自定义保存路径
     val defaultFilter: FilterType = FilterType.NONE,                      // 默认滤镜
@@ -144,6 +149,20 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             settingsRepository.getWatermarkText().collect { text ->
                 _uiState.update { it.copy(watermarkText = text) }
+            }
+        }
+
+        // 信息水印字段开关
+        viewModelScope.launch {
+            settingsRepository.getWatermarkFields().collect { fields ->
+                _uiState.update { it.copy(watermarkFields = fields) }
+            }
+        }
+
+        // 水印大小倍率
+        viewModelScope.launch {
+            settingsRepository.getWatermarkSizeScale().collect { scale ->
+                _uiState.update { it.copy(watermarkSizeScale = scale) }
             }
         }
 
@@ -278,6 +297,35 @@ class SettingsViewModel @Inject constructor(
         Log.d(TAG, "setWatermarkText: $text")
         viewModelScope.launch {
             settingsRepository.setWatermarkText(text)
+        }
+    }
+
+    /**
+     * 设置水印大小倍率
+     *
+     * @param scale 倍率，1.0 为基准
+     */
+    fun setWatermarkSizeScale(scale: Float) {
+        Log.d(TAG, "setWatermarkSizeScale: $scale")
+        viewModelScope.launch {
+            settingsRepository.setWatermarkSizeScale(scale)
+        }
+    }
+
+    /**
+     * 切换信息水印的某个字段显示开关
+     *
+     * 实时字段（经纬度/地址/时间/天气）只能开关；备注既能开关也能改内容。
+     *
+     * @param field 目标字段
+     * @param enabled 是否显示
+     */
+    fun toggleWatermarkField(field: WatermarkField, enabled: Boolean) {
+        val current = _uiState.value.watermarkFields
+        val updated = if (enabled) current + field else current - field
+        Log.d(TAG, "toggleWatermarkField: ${field.id}=$enabled, 结果=${WatermarkField.toIds(updated)}")
+        viewModelScope.launch {
+            settingsRepository.setWatermarkFields(updated)
         }
     }
 

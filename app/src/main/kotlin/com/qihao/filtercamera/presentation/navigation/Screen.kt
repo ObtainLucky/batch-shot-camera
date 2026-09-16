@@ -34,6 +34,13 @@ sealed class Screen(val route: String) {
     data object Settings : Screen("settings")
 
     /**
+     * 批次管理页面
+     *
+     * 从设置页进入，管理批次定义（新增/编辑/删除/重置序号）
+     */
+    data object BatchManage : Screen("batch_manage")
+
+    /**
      * 图片编辑页面
      *
      * 路由格式: edit/{imageUri}

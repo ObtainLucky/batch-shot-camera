@@ -68,6 +68,11 @@ sealed class PopupType {
     object ModeMenu : PopupType() {
         override fun toString(): String = "ModeMenu"
     }
+
+    /** 批次切换弹窗（批次拍摄） */
+    object BatchSelector : PopupType() {
+        override fun toString(): String = "BatchSelector"
+    }
 }
 
 /**
@@ -133,6 +138,10 @@ class PopupStateHolder @Inject constructor() {
     /** 模式菜单是否可见 */
     val isModeMenuVisible: Boolean
         get() = _popupState.value.activePopup == PopupType.ModeMenu
+
+    /** 批次切换弹窗是否可见 */
+    val isBatchSelectorVisible: Boolean
+        get() = _popupState.value.activePopup == PopupType.BatchSelector
 
     /** 是否有任何弹窗可见 */
     val hasActivePopup: Boolean
@@ -236,6 +245,9 @@ class PopupStateHolder @Inject constructor() {
     /** 切换模式菜单 */
     fun toggleModeMenu() = toggle(PopupType.ModeMenu)
 
+    /** 切换批次切换弹窗 */
+    fun toggleBatchSelector() = toggle(PopupType.BatchSelector)
+
     // ==================== 显示方法（语义化） ====================
 
     /** 显示滤镜选择器 */
@@ -255,4 +267,7 @@ class PopupStateHolder @Inject constructor() {
 
     /** 显示模式菜单 */
     fun showModeMenu() = show(PopupType.ModeMenu)
+
+    /** 显示批次切换弹窗 */
+    fun showBatchSelector() = show(PopupType.BatchSelector)
 }

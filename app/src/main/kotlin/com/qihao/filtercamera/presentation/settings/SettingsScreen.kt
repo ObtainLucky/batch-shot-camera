@@ -53,6 +53,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.WaterDrop
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -85,6 +86,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.qihao.filtercamera.domain.model.WatermarkField
 import com.qihao.filtercamera.domain.repository.GridType
 import com.qihao.filtercamera.domain.repository.PhotoQuality
 import com.qihao.filtercamera.domain.repository.SaveLocation
@@ -95,12 +97,14 @@ import com.qihao.filtercamera.domain.repository.VideoQuality
  * 设置页面
  *
  * @param onNavigateBack 返回回调
+ * @param onNavigateToBatchManage 导航到批次管理回调
  * @param viewModel ViewModel 实例
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
     onNavigateBack: () -> Unit,                                           // 返回回调
+    onNavigateToBatchManage: () -> Unit = {},                             // 批次管理入口
     viewModel: SettingsViewModel = hiltViewModel()                        // 注入 ViewModel
 ) {
     val uiState by viewModel.uiState.collectAsState()                     // 收集 UI 状态
@@ -189,6 +193,23 @@ fun SettingsScreen(
                     )
                 }
 
+                // 批次拍摄
+                item {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    SettingsSectionHeader(
+                        title = "批次拍摄",
+                        icon = Icons.Default.Folder
+                    )
+                }
+
+                item {
+                    NavigationSettingItem(
+                        title = "批次管理",
+                        subtitle = "定义批次命名规则与归档目录，拍摄时按序自动命名",
+                        onClick = onNavigateToBatchManage
+                    )
+                }
+
                 // 位置与水印
                 item {
                     Spacer(modifier = Modifier.height(8.dp))
@@ -209,8 +230,8 @@ fun SettingsScreen(
 
                 item {
                     SwitchSettingItem(
-                        title = "水印",
-                        subtitle = "在照片上添加水印",
+                        title = "信息水印",
+                        subtitle = "每张照片叠加经纬度/地址/时间/天气/备注（缺数据的行自动省略）",
                         checked = uiState.watermarkEnabled,
                         onCheckedChange = viewModel::setWatermarkEnabled
                     )
@@ -221,6 +242,20 @@ fun SettingsScreen(
                         WatermarkTextInput(
                             text = uiState.watermarkText,
                             onTextChange = viewModel::setWatermarkText
+                        )
+                    }
+
+                    item {
+                        WatermarkFieldSelector(
+                            enabledFields = uiState.watermarkFields,
+                            onFieldToggled = viewModel::toggleWatermarkField
+                        )
+                    }
+
+                    item {
+                        WatermarkSizeSlider(
+                            scale = uiState.watermarkSizeScale,
+                            onScaleChange = viewModel::setWatermarkSizeScale
                         )
                     }
                 }
@@ -392,6 +427,173 @@ private fun SettingsSectionHeader(
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.primary
         )
+    }
+}
+
+/**
+ * 跳转型设置项（点击进入子页面）
+ */
+@Composable
+private fun NavigationSettingItem(
+    title: String,                                                        // 标题
+    subtitle: String,                                                     // 副标题
+    onClick: () -> Unit                                                   // 点击回调
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+/**
+ * 信息水印字段开关
+ *
+ * 实时字段（经纬度/地址/时间/天气）只能决定显不显示；
+ * 备注既能开关也能在上面的输入框里改内容。
+ */
+@Composable
+private fun WatermarkFieldSelector(
+    enabledFields: Set<WatermarkField>,
+    onFieldToggled: (WatermarkField, Boolean) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                text = "显示内容",
+                style = MaterialTheme.typography.bodyLarge
+            )
+            Text(
+                text = "选择水印里出现哪几行，没数据的行本来就会自动省略",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            WatermarkField.entries.forEach { field ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onFieldToggled(field, field !in enabledFields) }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = field.label,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = if (field.liveData) "实时获取，不可编辑" else "在上面填写内容",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = field in enabledFields,
+                        onCheckedChange = { checked -> onFieldToggled(field, checked) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 水印大小滑块
+ *
+ * 倍率作用在"按图片宽度算出的基准字号"上，所以同一档在不同分辨率照片上观感一致。
+ * 信息水印有"缩到放得下"的保护，调大后遇到长地址会被自动缩回来，不会溢出画面。
+ */
+@Composable
+private fun WatermarkSizeSlider(
+    scale: Float,
+    onScaleChange: (Float) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        )
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = "水印大小", style = MaterialTheme.typography.bodyLarge)
+                Text(
+                    text = String.format(java.util.Locale.US, "%.1f×", scale),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+            Slider(
+                value = scale,
+                onValueChange = onScaleChange,
+                valueRange = 0.5f..2.0f,
+                steps = 14,                                            // 0.1 一档
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = "小 (0.5×)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "标准 (1.0×)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "大 (2.0×)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }
 
@@ -690,7 +892,9 @@ private fun WatermarkTextInput(
             OutlinedTextField(
                 value = text,
                 onValueChange = onTextChange,
-                label = { Text("自定义水印文字") },
+                label = { Text("备注") },
+                placeholder = { Text("如：段嘉轩 13297470239") },
+                supportingText = { Text("显示为水印里的「备注」一行，可填姓名、联系方式、项目名") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 leadingIcon = {

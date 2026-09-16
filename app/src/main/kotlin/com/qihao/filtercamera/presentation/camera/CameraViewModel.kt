@@ -29,10 +29,13 @@ import com.qihao.filtercamera.data.processor.PortraitBlurProcessor
 import com.qihao.filtercamera.data.processor.ScanState
 import com.qihao.filtercamera.data.processor.TimelapseEngine
 import com.qihao.filtercamera.data.processor.TimelapseState
+import com.qihao.filtercamera.data.sound.ShutterSoundPlayer
+import com.qihao.filtercamera.data.watermark.WatermarkInfoProvider
 import androidx.compose.ui.geometry.Offset
 import com.qihao.filtercamera.domain.model.AdaptiveFocusMode
 import com.qihao.filtercamera.domain.model.ApertureMode
 import com.qihao.filtercamera.domain.model.AspectRatio
+import com.qihao.filtercamera.domain.model.BatchConfig
 import com.qihao.filtercamera.domain.model.BeautyLevel
 import com.qihao.filtercamera.domain.model.CameraAdvancedSettings
 import com.qihao.filtercamera.domain.model.CameraEvent
@@ -42,14 +45,19 @@ import com.qihao.filtercamera.domain.model.CameraState
 import com.qihao.filtercamera.domain.model.FilterGroup
 import com.qihao.filtercamera.domain.model.FilterType
 import com.qihao.filtercamera.domain.model.FlashMode
+import com.qihao.filtercamera.domain.model.NamingMode
 import com.qihao.filtercamera.domain.model.FocusMode
 import com.qihao.filtercamera.domain.model.HdrMode
 import com.qihao.filtercamera.domain.model.MacroMode
 import com.qihao.filtercamera.domain.model.NightMode
+import com.qihao.filtercamera.domain.model.PortraitBlurLevel
 import com.qihao.filtercamera.domain.model.ProModeSettings
 import com.qihao.filtercamera.domain.model.TimerMode
 import com.qihao.filtercamera.domain.model.WhiteBalanceMode
 import com.qihao.filtercamera.domain.model.ZoomConfig
+import com.qihao.filtercamera.domain.repository.GridType
+import com.qihao.filtercamera.domain.repository.IBatchRepository
+import com.qihao.filtercamera.domain.repository.ISettingsRepository
 import com.qihao.filtercamera.domain.usecase.CameraUseCase
 import com.qihao.filtercamera.presentation.camera.components.HistogramCalculator
 import com.qihao.filtercamera.presentation.camera.components.HistogramData
@@ -61,9 +69,15 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -79,6 +93,7 @@ private const val TAG = "CameraViewModel"  // 日志标签
  * @param documentScanProcessor 文档扫描处理器（文档模式）
  * @param mlKitDocumentScanner ML Kit文档扫描器（高级文档扫描）
  * @param popupStateHolder 弹窗状态管理器（统一管理所有弹窗互斥）
+ * @param batchRepository 批次仓库（批次拍摄：命名规则 + 归档目录 + 序号计数）
  */
 @HiltViewModel
 class CameraViewModel @Inject constructor(
@@ -88,7 +103,11 @@ class CameraViewModel @Inject constructor(
     private val timelapseEngine: TimelapseEngine,                     // 延时摄影引擎
     private val portraitBlurProcessor: PortraitBlurProcessor,         // 人像虚化处理器
     val mlKitDocumentScanner: MLKitDocumentScanner,                   // ML Kit文档扫描器
-    val popupStateHolder: PopupStateHolder                            // 弹窗状态管理器
+    val popupStateHolder: PopupStateHolder,                           // 弹窗状态管理器
+    private val batchRepository: IBatchRepository,                    // 批次仓库
+    private val watermarkInfoProvider: WatermarkInfoProvider,          // 信息水印数据（含持续定位）
+    private val settingsRepository: ISettingsRepository,              // 设置仓库（默认值生效用）
+    private val shutterSoundPlayer: ShutterSoundPlayer                // 快门声
 ) : ViewModel() {
 
     // ==================== 核心UI状态 ====================
@@ -164,6 +183,12 @@ class CameraViewModel @Inject constructor(
     // 对焦超时时间（毫秒）
     private companion object FocusConfig {
         const val FOCUS_TIMEOUT_MS = 3000L                            // 对焦指示器显示时间
+
+        /** 拍照闪屏最短显示时长：太短会闪一下看不见，与快门动作对不上 */
+        const val MIN_CAPTURE_FLASH_MS = 120L
+
+        /** 左下角缩略图尺寸（像素） */
+        const val THUMBNAIL_SIZE = 100
     }
 
     // 可用滤镜分组（委托给状态管理器）
@@ -171,6 +196,92 @@ class CameraViewModel @Inject constructor(
 
     // 可用滤镜列表（委托给状态管理器）
     val availableFilters: List<FilterType> get() = filterSelectorState.availableFilters
+
+    /**
+     * 快门声开关（缓存）
+     *
+     * 拍照时要求"按下即响"，不能每次去读 DataStore；
+     * 这里在初始化时读一次并持续跟随设置变化。
+     */
+    @Volatile
+    private var shutterSoundEnabled: Boolean = true
+
+    /**
+     * 是否可以作废上一张
+     *
+     * 只在本进程内拍过照片、且选了批次时才允许 —— 重启后追溯不到"上一张"，
+     * 盲目按序号回退可能删错文件，宁可禁用。
+     */
+    private val _canUndoLastShot = MutableStateFlow(false)
+    val canUndoLastShot: StateFlow<Boolean> = _canUndoLastShot.asStateFlow()
+
+    /**
+     * 待补拍标记
+     *
+     * 正在拍照时用户又按了快门，记下来等这张拍完立刻补上。
+     * 直接丢弃点击（早期行为）会让快速补拍"点了没反应"，手感很差；
+     * 串行补拍也不会破坏批次命名（命名依赖 counter，必须一张一张来）。
+     */
+    private var pendingCapture: Boolean = false
+
+    /**
+     * 取景网格类型（设置页可改）
+     */
+    val gridType: StateFlow<GridType> = settingsRepository.getGridType()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), GridType.NONE)
+
+    /**
+     * 是否镜像前置预览
+     */
+    val mirrorPreviewEnabled: StateFlow<Boolean> = settingsRepository.isMirrorPreviewEnabled()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    init {
+        // 快门声开关缓存一份，供"按下即响"使用
+        viewModelScope.launch {
+            settingsRepository.isShutterSoundEnabled()
+                .catch { Log.w(TAG, "观察快门声开关失败", it) }
+                .collect { enabled -> shutterSoundEnabled = enabled }
+        }
+    }
+
+    /**
+     * 当前是否需要把预览水平翻转
+     *
+     * 前置 + 开启镜像才翻转。界面据此设置预览的 scaleX，
+     * 同时触摸对焦的 X 坐标也要跟着取反（见 CameraScreen）。
+     */
+    val isPreviewMirrored: StateFlow<Boolean> = combine(
+        uiState,
+        mirrorPreviewEnabled
+    ) { state, mirror -> mirror && state.lens == CameraLens.FRONT }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
+    // ==================== 批次拍摄状态 ====================
+
+    /**
+     * 全部批次列表（驱动「切换批次」弹窗）
+     */
+    val batches: StateFlow<List<BatchConfig>> = batchRepository.batches
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /**
+     * 当前选中批次
+     *
+     * 直接来自 DataStore，因此拍照后 counter 变化会自动推送 ——
+     * 「下一张: BA_003.jpg」不需要手动刷新。
+     */
+    val currentBatch: StateFlow<BatchConfig?> = batchRepository.currentBatch
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
+     * 批次切换弹窗是否可见
+     *
+     * 走 PopupStateHolder，与滤镜选择器/模式菜单等保持互斥。
+     */
+    val isBatchSheetVisible: StateFlow<Boolean> = popupStateHolder.popupState
+        .map { it.activePopup == PopupType.BatchSelector }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     // ==================== 初始化 ====================
 
@@ -188,6 +299,39 @@ class CameraViewModel @Inject constructor(
         observeTimelapseProgress()                                    // 观察延时摄影进度
         observePortraitBlurProgress()                                 // 观察人像虚化处理进度
         loadInitialGalleryThumbnail()                                 // 加载初始相册缩略图
+        // 相机页可见期间持续订阅定位，让水印里的经纬度跟着人走
+        watermarkInfoProvider.startLiveUpdates()
+        applyDefaultSettings()                                        // 应用设置里的默认滤镜/美颜/HDR
+    }
+
+    /**
+     * 应用设置页里的默认值
+     *
+     * 这三项在设置页里能改，但此前没有任何功能代码读取，改了完全没反应 ——
+     * 用户会以为 App 坏了。这里在相机初始化时读一次并真正应用。
+     */
+    private fun applyDefaultSettings() = viewModelScope.launch {
+        try {
+            // 默认滤镜
+            val defaultFilter = settingsRepository.getDefaultFilter().first()
+            if (defaultFilter != FilterType.NONE) {
+                Log.d(TAG, "applyDefaultSettings: 应用默认滤镜 $defaultFilter")
+                selectFilter(defaultFilter)
+            }
+
+            // 默认美颜强度
+            val defaultBeauty = settingsRepository.getDefaultBeautyIntensity().first()
+            Log.d(TAG, "applyDefaultSettings: 应用默认美颜强度 $defaultBeauty")
+            useCase.setBeautyIntensity(defaultBeauty)
+
+            // HDR 自动模式
+            val hdrAuto = settingsRepository.isHdrAutoEnabled().first()
+            val hdrMode = if (hdrAuto) HdrMode.AUTO else HdrMode.OFF
+            Log.d(TAG, "applyDefaultSettings: 应用默认 HDR=$hdrMode")
+            setHdrMode(hdrMode)
+        } catch (e: Exception) {
+            Log.e(TAG, "applyDefaultSettings: 读取默认设置失败", e)
+        }
     }
 
     /**
@@ -500,8 +644,14 @@ class CameraViewModel @Inject constructor(
      * 文档模式：额外应用扫描效果
      */
     fun takePhoto() {
-        if (_uiState.value.isCapturing || _uiState.value.isCountingDown) {
-            Log.w(TAG, "takePhoto: 正在拍照或倒计时中，忽略请求")
+        if (_uiState.value.isCapturing) {
+            // 正在拍：记一个待拍，等这张结束立刻补上，而不是把点击吞掉
+            Log.d(TAG, "takePhoto: 正在拍照，记为待补拍")
+            pendingCapture = true
+            return
+        }
+        if (_uiState.value.isCountingDown) {
+            Log.w(TAG, "takePhoto: 倒计时中，忽略请求")
             return
         }
 
@@ -563,6 +713,14 @@ class CameraViewModel @Inject constructor(
      * 5. 隐藏闪屏
      */
     private fun executePhoto() {
+        // ===== 按下即刻反馈 =====
+        // 快门声必须在这一刻响，不能等拍照流程跑完 ——
+        // 放到 onSuccess 里会让声音滞后约半秒，与"按下即响"的正常相机手感完全不同。
+        if (shutterSoundEnabled) {
+            shutterSoundPlayer.play()
+        }
+
+        val flashStartMs = android.os.SystemClock.elapsedRealtime()
         viewModelScope.launch {
             val mode = _uiState.value.mode
             Log.d(TAG, "executePhoto: 开始拍照 mode=$mode")
@@ -577,32 +735,275 @@ class CameraViewModel @Inject constructor(
                 )
             }
 
-            // 延迟一点隐藏闪屏（让用户看到闪屏效果）
-            kotlinx.coroutines.delay(100)
-            _uiState.update { it.copy(isCaptureFlashVisible = false) }
-
+            // 注意：这里不再做人为 delay。
+            // 早期实现是"先闪 100ms 再开始拍照"，既白等 100ms，
+            // 又让闪屏在拍照还在进行时就灭了，视觉与动作是错位的。
             useCase.takePhoto()
                 .onSuccess { uri ->
                     Log.d(TAG, "executePhoto: 拍照成功 uri=$uri")
                     _events.emit(CameraEvent.PhotoCaptured(uri.toString()))
-                    // 更新相册缩略图（使用当前预览帧作为临时缩略图）- 修复：添加isRecycled检查
-                    currentPreviewFrame?.let { frame ->
-                        if (!frame.isRecycled) {
-                            try {
-                                val thumbnail = Bitmap.createScaledBitmap(frame, 100, 100, true)
-                                _galleryThumbnail.value = thumbnail
-                            } catch (e: Exception) {
-                                Log.e(TAG, "executePhoto: 创建缩略图失败", e)
-                            }
-                        }
-                    }
+                    // currentBatch 来自 DataStore，序号递增后会自动推新，
+                    // 「下一张: BA_00X.jpg」无需在这里手动刷新
+                    refreshUndoAvailability()                         // 刚拍过，可以作废
+                    // 更新左下角缩略图：优先显示"刚拍到的成片"，
+                    // 正常相机点完快门缩略图立刻变成新照片；用拍照前的预览帧会显得对不上。
+                    updateGalleryThumbnailAfterCapture()
                 }
                 .onFailure { error ->
                     Log.e(TAG, "executePhoto: 拍照失败", error)
                     _events.emit(CameraEvent.Error(error.message ?: "拍照失败"))
                 }
-            _uiState.update { it.copy(isCapturing = false) }
+
+            // 闪屏至少显示 MIN_FLASH_MS，避免拍照很快时闪一下看不见；
+            // 若拍照本身较慢，则闪屏一直显示到拍照结束 —— 让视觉和动作同步。
+            val elapsed = android.os.SystemClock.elapsedRealtime() - flashStartMs
+            val remain = (MIN_CAPTURE_FLASH_MS - elapsed).coerceAtLeast(0)
+            if (remain > 0) kotlinx.coroutines.delay(remain)
+
+            _uiState.update { it.copy(isCapturing = false, isCaptureFlashVisible = false) }
+
+            // 有排队中的补拍请求就立刻接着拍（串行，保证批次命名不冲突）
+            if (pendingCapture) {
+                pendingCapture = false
+                Log.d(TAG, "executePhoto: 执行排队中的补拍")
+                executePhoto()
+            }
         }
+    }
+
+    // ==================== 批次拍摄操作 ====================
+
+    /**
+     * 切换到指定批次
+     *
+     * 不在这里关闭弹窗 —— 由 UI 在动作发出后带下滑动画收起；
+     * 失败时保持弹窗打开，方便用户直接重试。
+     *
+     * @param id 批次id
+     */
+    fun selectBatch(id: String) = viewModelScope.launch {
+        Log.d(TAG, "selectBatch: 选择批次 id=$id")
+        batchRepository.selectBatch(id)
+            .onFailure { error ->
+                Log.e(TAG, "selectBatch: 选择失败 id=$id", error)
+                _events.emit(CameraEvent.Error("切换批次失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 取消批次选择，回落默认命名（IMG_yyyyMMdd_HHmmss.jpg）
+     */
+    fun clearBatch() = viewModelScope.launch {
+        Log.d(TAG, "clearBatch: 取消批次选择")
+        batchRepository.clearSelection()
+            .onFailure { error ->
+                Log.e(TAG, "clearBatch: 取消失败", error)
+                _events.emit(CameraEvent.Error("取消批次失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 新建批次并立即选中
+     *
+     * 新建后自动选中符合"选批次 -> 拍摄"的操作直觉，
+     * 免得用户建完还要再点一次。
+     */
+    fun createBatch(
+        name: String,
+        dirName: String,
+        namePrefix: String,
+        startIndex: Int = BatchConfig.DEFAULT_START_INDEX,
+        indexWidth: Int = BatchConfig.DEFAULT_INDEX_WIDTH,
+        dateSubDir: Boolean = false,
+        namingMode: NamingMode = NamingMode.SEQUENCE,
+        nameList: List<String> = emptyList(),
+        note: String = ""
+    ) = viewModelScope.launch {
+        // 目录名冲突会让两批照片落进同一个相册，这里直接拦住
+        val conflicts = batches.value.firstOrNull {
+            it.safeDirName.equals(dirName.trim(), ignoreCase = true)
+        }
+        if (conflicts != null) {
+            Log.w(TAG, "createBatch: 目录名重复 dirName=$dirName, 已存在=${conflicts.name}")
+            _events.emit(CameraEvent.Error("目录名 ${dirName.trim()} 已被批次「${conflicts.name}」占用"))
+            return@launch
+        }
+
+        val batch = BatchConfig.create(
+            name = name,
+            dirName = dirName,
+            namePrefix = namePrefix,
+            startIndex = startIndex,
+            indexWidth = indexWidth,
+            dateSubDir = dateSubDir
+        ).copy(namingMode = namingMode, nameList = nameList, note = note.trim()).normalized()
+        batchRepository.addBatch(batch)
+            .onSuccess {
+                Log.d(TAG, "createBatch: 新建成功 name=${batch.name}, id=${batch.id}")
+                batchRepository.selectBatch(batch.id).onFailure { error ->
+                    Log.e(TAG, "createBatch: 新建后自动选中失败 id=${batch.id}", error)
+                }
+                _events.emit(CameraEvent.Info("批次「${batch.name}」已创建，下一张 ${batch.nextFileName()}"))
+            }
+            .onFailure { error ->
+                Log.e(TAG, "createBatch: 新建失败", error)
+                _events.emit(CameraEvent.Error("新建批次失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 打开批次切换弹窗
+     */
+    fun showBatchSheet() {
+        Log.d(TAG, "showBatchSheet: 打开批次切换弹窗")
+        popupStateHolder.showBatchSelector()
+    }
+
+    /**
+     * 关闭批次切换弹窗
+     */
+    fun hideBatchSheet() {
+        Log.d(TAG, "hideBatchSheet: 关闭批次切换弹窗")
+        if (popupStateHolder.isBatchSelectorVisible) {
+            popupStateHolder.hide()
+        }
+    }
+
+    /**
+     * 刷新"可作废"状态
+     */
+    private fun refreshUndoAvailability() = viewModelScope.launch {
+        val hasBatch = currentBatch.value != null
+        val hasLast = useCase.canUndoLastShot()
+        _canUndoLastShot.value = hasBatch && hasLast
+    }
+
+    /**
+     * 作废上一张并回退名字序号（弹确认框由 UI 负责）
+     */
+    fun undoLastShot() = viewModelScope.launch {
+        val batch = currentBatch.value
+        if (batch == null) {
+            _events.emit(CameraEvent.Error("没有选中批次，无法作废"))
+            return@launch
+        }
+
+        useCase.undoLastShot()
+            .onSuccess {
+                val nextName = batch.withCounterDecremented().nextFileName()
+                Log.d(TAG, "undoLastShot: 已作废上一张，下一张=$nextName")
+                refreshUndoAvailability()
+                _events.emit(CameraEvent.Info("已作废上一张，下一张 $nextName"))
+            }
+            .onFailure { error ->
+                Log.e(TAG, "undoLastShot: 作废失败", error)
+                _events.emit(CameraEvent.Error("作废失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 拍照后刷新左下角缩略图
+     *
+     * 先拿真实成片（含水印/滤镜效果），拿不到再退回预览帧，
+     * 保证缩略图至少会更新，而不是一直停在旧图上。
+     */
+    private fun updateGalleryThumbnailAfterCapture() = viewModelScope.launch(Dispatchers.IO) {
+        try {
+            val latest = useCase.getLatestGalleryThumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+            if (latest != null) {
+                _galleryThumbnail.value = latest
+                Log.d(TAG, "updateGalleryThumbnailAfterCapture: 已使用成片作为缩略图")
+                return@launch
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "updateGalleryThumbnailAfterCapture: 读取成片失败，回退预览帧", e)
+        }
+
+        // 回退：用当前预览帧缩放一张
+        currentPreviewFrame?.let { frame ->
+            if (!frame.isRecycled) {
+                try {
+                    _galleryThumbnail.value = Bitmap.createScaledBitmap(frame, THUMBNAIL_SIZE, THUMBNAIL_SIZE, true)
+                } catch (e: Exception) {
+                    Log.e(TAG, "updateGalleryThumbnailAfterCapture: 创建缩略图失败", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * 拍摄清单弹窗是否可见
+     *
+     * 现场最需要的是"还剩哪几个名字没拍"，只显示序号是不够的。
+     */
+    private val _isShotListVisible = MutableStateFlow(false)
+    val isShotListVisible: StateFlow<Boolean> = _isShotListVisible.asStateFlow()
+
+    /**
+     * 打开/关闭拍摄清单
+     */
+    fun showShotList(visible: Boolean) {
+        Log.d(TAG, "showShotList: visible=$visible")
+        _isShotListVisible.value = visible
+    }
+
+    /**
+     * 在清单里选择某一项
+     *
+     * - 未拍过 -> 直接跳过去拍（跳过的项保持未拍，后续会自动回头补拍）
+     * - 已拍过 -> 视为重拍：先删掉原来那张，再把指针指回它
+     *
+     * @param index 名字下标
+     */
+    fun selectNameFromList(index: Int) = viewModelScope.launch {
+        val batch = currentBatch.value
+        if (batch == null) {
+            _events.emit(CameraEvent.Error("没有选中批次"))
+            return@launch
+        }
+
+        val alreadyShot = batch.isNameShot(index)
+        Log.d(TAG, "selectNameFromList: index=$index, 已拍=$alreadyShot")
+
+        if (!alreadyShot) {
+            batchRepository.setNamePointer(batch.id, index)
+                .onSuccess {
+                    val name = batch.withNamePointer(index).nextFileName()
+                    _isShotListVisible.value = false
+                    _events.emit(CameraEvent.Info("下一张：$name"))
+                }
+                .onFailure { error ->
+                    Log.e(TAG, "selectNameFromList: 跳转失败", error)
+                    _events.emit(CameraEvent.Error("切换拍摄项失败：${error.message ?: "未知错误"}"))
+                }
+            return@launch
+        }
+
+        // 重拍：删旧照片 -> 指针回退到该项
+        useCase.reshootName(batch, index)
+            .onSuccess { deleted ->
+                val name = batch.withReshoot(index).nextFileName()
+                _isShotListVisible.value = false
+                Log.d(TAG, "selectNameFromList: 已标记重拍，删除旧照片=$deleted")
+                _events.emit(
+                    CameraEvent.Info(
+                        if (deleted) "已删除原照片，下一张重拍：$name"
+                        else "下一张重拍：$name（未找到原照片）"
+                    )
+                )
+            }
+            .onFailure { error ->
+                Log.e(TAG, "selectNameFromList: 重拍准备失败", error)
+                _events.emit(CameraEvent.Error("重拍失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 切换批次切换弹窗
+     */
+    fun toggleBatchSheet() {
+        Log.d(TAG, "toggleBatchSheet: 切换批次弹窗")
+        popupStateHolder.toggleBatchSelector()
     }
 
     /**
@@ -764,6 +1165,15 @@ class CameraViewModel @Inject constructor(
             else -> {}
         }
 
+        // 离开人像模式时必须关掉虚化：
+        // 虚化处理要跑一遍 ML Kit 人像分割，1200 万像素下单张就要 5 秒左右，
+        // 而 takePhoto 只看"虚化等级是否为 NONE"，不看当前模式 ——
+        // 不在这里关掉，普通拍照模式下每张照片都会被白跑一遍并被动虚化。
+        if (mode != CameraMode.PORTRAIT && _uiState.value.portraitBlurLevel != PortraitBlurLevel.NONE) {
+            Log.d(TAG, "selectMode: 离开人像模式，关闭人像虚化")
+            applyPortraitBlurLevelToCamera(PortraitBlurLevel.NONE)
+        }
+
         // 启用新模式的处理器
         when (mode) {
             CameraMode.PORTRAIT -> {
@@ -775,9 +1185,15 @@ class CameraViewModel @Inject constructor(
                 }
                 // 初始化人像虚化处理器
                 initializePortraitBlurProcessor()
+                // 恢复用户上次选择的人像虚化等级（未选择时为中度）
+                applyPortraitBlurLevelToCamera(_uiState.value.portraitBlurLevel)
                 // 重置人像模式覆盖层可见性
                 _uiState.update { it.copy(isPortraitOverlayVisible = true) }
-                Log.d(TAG, "selectMode: 启用人脸检测、追踪对焦和人像虚化")
+                Log.d(
+                    TAG,
+                    "selectMode: 启用人脸检测、追踪对焦和人像虚化，" +
+                        "虚化等级=${_uiState.value.portraitBlurLevel.displayName}"
+                )
             }
             CameraMode.DOCUMENT -> {
                 documentScanProcessor.enable()
@@ -1525,6 +1941,22 @@ class CameraViewModel @Inject constructor(
     }
 
     /**
+     * 只把虚化等级同步给相机，不修改 UI 状态
+     *
+     * 「离开人像模式时关闭虚化」用的是这个方法：清掉的是相机侧的开关，
+     * uiState.portraitBlurLevel 仍保留用户的选择，回到人像模式时再恢复，
+     * 不会因为切了一次模式就把用户设置的虚化等级抹掉。
+     */
+    private fun applyPortraitBlurLevelToCamera(level: PortraitBlurLevel) {
+        viewModelScope.launch {
+            useCase.setPortraitBlurLevel(level)
+                .onFailure { error ->
+                    Log.e(TAG, "applyPortraitBlurLevelToCamera: 同步虚化等级失败 level=${level.displayName}", error)
+                }
+        }
+    }
+
+    /**
      * 设置人像虚化等级
      *
      * @param level 虚化等级（NONE/LIGHT/MEDIUM/HEAVY）
@@ -2095,6 +2527,7 @@ class CameraViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         Log.d(TAG, "onCleared: 释放资源")
+        watermarkInfoProvider.stopLiveUpdates()                            // 停止持续定位（省电）
         timerJob?.cancel()                                                // 取消定时拍照倒计时
         focusTimeoutJob?.cancel()                                         // 取消对焦超时Job
         timelapseJob?.cancel()                                            // 取消延时摄影帧捕获Job

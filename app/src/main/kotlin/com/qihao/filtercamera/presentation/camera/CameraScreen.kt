@@ -63,6 +63,11 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -88,12 +93,15 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
+import com.qihao.filtercamera.domain.model.BatchConfig
 import com.qihao.filtercamera.domain.model.CameraEvent
 import com.qihao.filtercamera.domain.model.CameraMode
 import com.qihao.filtercamera.domain.model.FilterType
 import com.qihao.filtercamera.domain.model.AspectRatio
 import com.qihao.filtercamera.domain.model.HdrMode
 import com.qihao.filtercamera.presentation.camera.components.CameraModeSelector
+import com.qihao.filtercamera.presentation.camera.components.BatchBar
+import com.qihao.filtercamera.presentation.camera.components.BatchSelectorSheet
 import com.qihao.filtercamera.presentation.camera.components.CompactCameraTopBar
 import com.qihao.filtercamera.presentation.camera.components.CompactHistogramView
 import com.qihao.filtercamera.presentation.camera.components.DocumentBoundsOverlay
@@ -103,6 +111,8 @@ import com.qihao.filtercamera.presentation.camera.components.DocumentScanModeUI
 import com.qihao.filtercamera.presentation.camera.components.FaceDetectionOverlay
 import com.qihao.filtercamera.presentation.camera.components.FaceTrackingStateIndicator
 import com.qihao.filtercamera.presentation.camera.components.FocusIndicator
+import com.qihao.filtercamera.presentation.camera.components.GridOverlay
+import com.qihao.filtercamera.presentation.camera.components.ShotListSheet
 import com.qihao.filtercamera.presentation.camera.components.NewCameraBottomControls
 import com.qihao.filtercamera.presentation.camera.components.NightModeHint
 import com.qihao.filtercamera.presentation.camera.components.NightProcessingIndicator
@@ -156,6 +166,9 @@ fun CameraScreen(
         permissions = buildList {
             add(Manifest.permission.CAMERA)
             add(Manifest.permission.RECORD_AUDIO)
+            // 信息水印需要定位来填经纬度与地址；拒绝也不影响拍照，只是水印少两行
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+            add(Manifest.permission.ACCESS_COARSE_LOCATION)
             // Android 13+ 使用细粒度媒体权限
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add(Manifest.permission.READ_MEDIA_IMAGES)
@@ -181,6 +194,10 @@ fun CameraScreen(
                 }
                 is CameraEvent.Error -> {                                 // 错误
                     Log.e(TAG, "Error: ${event.message}")
+                    Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
+                }
+                is CameraEvent.Info -> {                                  // 提示（非错误，如批次创建成功）
+                    Log.d(TAG, "Info: ${event.message}")
                     Toast.makeText(context, event.message, Toast.LENGTH_SHORT).show()
                 }
                 is CameraEvent.CameraSwitched -> {                        // 摄像头切换
@@ -326,6 +343,22 @@ private fun CameraContent(
     // 订阅直方图数据（专业模式）
     val histogramData by viewModel.histogramData.collectAsState()
 
+    // 订阅取景网格与镜像预览状态
+    val gridType by viewModel.gridType.collectAsState()
+    val isPreviewMirrored by viewModel.isPreviewMirrored.collectAsState()
+
+    // 作废上一张的可用性与确认框（删除照片不可撤销，必须二次确认）
+    val canUndoLastShot by viewModel.canUndoLastShot.collectAsState()
+    val isShotListVisible by viewModel.isShotListVisible.collectAsState()
+    var showUndoConfirm by remember { mutableStateOf(false) }
+    // 待确认重拍的名字下标（会删除原照片，所以先问一下）
+    var pendingReshootIndex by remember { mutableStateOf<Int?>(null) }
+
+    // 订阅批次状态（批次拍摄）
+    val currentBatch by viewModel.currentBatch.collectAsState()
+    val batches by viewModel.batches.collectAsState()
+    val isBatchSheetVisible by viewModel.isBatchSheetVisible.collectAsState()
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -359,9 +392,16 @@ private fun CameraContent(
             modifier = previewModifier,
             contentAlignment = Alignment.Center
         ) {
-            // 1.1 相机预览
+            // 1.1 相机预览（前置 + 开启镜像时水平翻转）
             CameraPreview(
                 viewModel = viewModel,
+                isMirrored = isPreviewMirrored,
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // 1.15 取景网格线（设置页可切换类型）
+            GridOverlay(
+                gridType = gridType,
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -386,7 +426,10 @@ private fun CameraContent(
                                 // 等待按下事件
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 val downOffset = down.position
-                                val normalizedX = downOffset.x / size.width
+                                // 预览被镜像时，用户看到的左右与实际画面相反，
+                                // 对焦坐标必须一起翻转，否则点左边会对到右边
+                                val rawX = downOffset.x / size.width
+                                val normalizedX = if (isPreviewMirrored) 1f - rawX else rawX
                                 val normalizedY = downOffset.y / size.height
                                 // 按下时立即显示对焦框
                                 viewModel.updateFocusPointPreview(normalizedX, normalizedY)
@@ -399,14 +442,16 @@ private fun CameraContent(
                                     if (change != null && change.pressed) {
                                         // 手指移动时更新对焦框位置
                                         lastOffset = change.position
-                                        val dragNormalizedX = lastOffset.x / size.width
+                                        val dragRawX = lastOffset.x / size.width
+                                        val dragNormalizedX = if (isPreviewMirrored) 1f - dragRawX else dragRawX
                                         val dragNormalizedY = lastOffset.y / size.height
                                         viewModel.updateFocusPointPreview(dragNormalizedX, dragNormalizedY)
                                     }
                                 } while (event.changes.any { it.pressed })
 
                                 // 手指抬起时触发实际对焦
-                                val releaseNormalizedX = lastOffset.x / size.width
+                                val releaseRawX = lastOffset.x / size.width
+                                val releaseNormalizedX = if (isPreviewMirrored) 1f - releaseRawX else releaseRawX
                                 val releaseNormalizedY = lastOffset.y / size.height
                                 Log.d(TAG, "触摸对焦: 抬起位置=($releaseNormalizedX, $releaseNormalizedY)")
                                 viewModel.onPreviewTouchFocus(releaseNormalizedX, releaseNormalizedY)
@@ -468,7 +513,118 @@ private fun CameraContent(
                 .padding(top = dimens.spacing.lg)                         // 响应式顶部间距
         )
 
-        // 4. 变焦指示器和滑块已移至底部 Column 内部，位于滤镜选择器下方
+        // 4. 批次条 - 位于 TopBar 下方，显示当前批次与"下一张"文件名
+        //
+        // 只在拍照模式显示：人像/文档/夜景/延时模式各自有一条居中提示条占着同一位置，
+        // 同屏显示会互相压住。批次命名本身对所有走 takePhoto() 的模式都生效，
+        // 这里收窄的只是入口的显示范围。
+        if (uiState.mode == CameraMode.PHOTO) {
+            BatchBar(
+                current = currentBatch,
+                onClick = viewModel::showBatchSheet,
+                canUndoLastShot = canUndoLastShot,
+                onUndoLastShot = { showUndoConfirm = true },
+                onOpenShotList = { viewModel.showShotList(true) },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(
+                        top = dimens.topBarHeight + dimens.spacing.sm,    // 紧贴 TopBar 下方
+                        start = dimens.spacing.lg,
+                        end = dimens.spacing.lg
+                    )
+            )
+        }
+
+        // 4.05 拍摄清单（现场核对"还剩哪几个没拍"，点某项即从该项续拍）
+        ShotListSheet(
+            visible = isShotListVisible,
+            batch = currentBatch,
+            onJumpTo = { index ->
+                // 已拍过的项=重拍：删除原照片不可恢复，先确认；未拍过的直接跳过去
+                if (currentBatch?.isNameShot(index) == true) {
+                    pendingReshootIndex = index
+                } else {
+                    viewModel.selectNameFromList(index)
+                }
+            },
+            onDismiss = { viewModel.showShotList(false) }
+        )
+
+        // 4.1 批次切换底部弹窗
+        BatchSelectorSheet(
+            visible = isBatchSheetVisible,
+            batches = batches,
+            currentBatchId = currentBatch?.id,
+            onSelect = viewModel::selectBatch,
+            onClear = viewModel::clearBatch,
+            onCreate = { name, dirName, prefix, startIndex, indexWidth, dateSubDir, mode, names, noteText ->
+                viewModel.createBatch(
+                    name = name,
+                    dirName = dirName,
+                    namePrefix = prefix,
+                    startIndex = startIndex,
+                    indexWidth = indexWidth,
+                    dateSubDir = dateSubDir,
+                    namingMode = mode,
+                    nameList = names,
+                    note = noteText
+                )
+            },
+            onDismiss = viewModel::hideBatchSheet
+        )
+
+        // 4.15 重拍确认（会永久删除该项原来的照片）
+        pendingReshootIndex?.let { index ->
+            val names = currentBatch?.effectiveNameList ?: emptyList()
+            val targetName = names.getOrNull(index)
+            AlertDialog(
+                onDismissRequest = { pendingReshootIndex = null },
+                title = { Text("重拍这一项？") },
+                text = {
+                    Text(
+                        "将删除「${targetName ?: ""}」原来那张照片，然后重新拍这一项。" +
+                            "\n\n删除后无法恢复。"
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        pendingReshootIndex = null
+                        viewModel.selectNameFromList(index)
+                    }) {
+                        Text("删除并重拍")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingReshootIndex = null }) { Text("取消") }
+                }
+            )
+        }
+
+        // 4.2 作废上一张的二次确认（会永久删除刚拍的照片）
+        if (showUndoConfirm) {
+            AlertDialog(
+                onDismissRequest = { showUndoConfirm = false },
+                title = { Text("作废上一张？") },
+                text = {
+                    Text(
+                        "将删除刚拍的这张照片，并把名字序号回退一位，" +
+                            "下一张用同一个名字重拍。\n\n删除后无法恢复。"
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showUndoConfirm = false
+                        viewModel.undoLastShot()
+                    }) {
+                        Text("作废并回退")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showUndoConfirm = false }) { Text("取消") }
+                }
+            )
+        }
 
         // 5. 人像模式：人脸检测框覆盖层
         if (uiState.mode == CameraMode.PORTRAIT && uiState.detectedFaces.isNotEmpty()) {
@@ -806,31 +962,13 @@ private fun CameraContent(
                 )
                 NewCameraBottomControls(
                     galleryThumbnail = galleryThumbnail,
-                    onGalleryClick = {
-                        try {
-                            val intent = Intent(Intent.ACTION_PICK).apply {
-                                setDataAndType(
-                                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                    "image/*"
-                                )
-                            }
-                            context.startActivity(intent)
-                        } catch (e: Exception) {
-                            try {
-                                val fallbackIntent = Intent(Intent.ACTION_VIEW).apply {
-                                    setDataAndType(
-                                        android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                                        "image/*"
-                                    )
-                                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                                }
-                                context.startActivity(fallbackIntent)
-                            } catch (e2: Exception) {
-                                Log.e(TAG, "打开相册失败: ${e2.message}")
-                                Toast.makeText(context, "无法打开相册", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    },
+                    // 打开 App 自己的相册页（网格浏览 / 搜索 / 删除 / 进编辑器）
+                    //
+                    // 这里原来发的是 Intent.ACTION_PICK —— 那是"挑一张图交给调用方"的选图器，
+                    // 选完结果没人接收，所以点开只看到选图界面、看不到刚拍的照片，
+                    // 完全不像正常相机"点缩略图看照片"的行为。
+                    // 相册页本来就有，onNavigateToGallery 也一路传进来了，只是之前没接上。
+                    onGalleryClick = onNavigateToGallery,
                     onShutterClick = {
                         if (CameraMode.isVideoMode(uiState.mode)) {
                             viewModel.toggleRecording()
@@ -877,6 +1015,7 @@ private fun FilteredFrameOverlay(
 @Composable
 fun CameraPreview(
     viewModel: CameraViewModel,
+    isMirrored: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -887,6 +1026,11 @@ fun CameraPreview(
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
             scaleType = PreviewView.ScaleType.FILL_CENTER                 // 填充中心，保持比例
         }
+    }
+
+    // 镜像预览：只翻转显示，不动相机数据流
+    LaunchedEffect(isMirrored) {
+        previewView.scaleX = if (isMirrored) -1f else 1f
     }
 
     // 绑定相机到PreviewView
