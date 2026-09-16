@@ -1,4 +1,75 @@
+# batch-shot-camera（批次拍摄相机）
 
+> 本项目基于 [Pangu-Immortal/FilterCamera](https://github.com/Pangu-Immortal/FilterCamera)（MIT License）改造，
+> 在原项目基础上增加了**批次拍摄 / 工作模式 / 信息水印 / 拍摄清单**等面向现场记录的能力。
+> 原始版权与许可声明保留在 [LICENSE](LICENSE) 中，请一并遵守。
+
+---
+
+## 这个项目解决什么问题
+
+现场作业（设备上架、巡检、盘点）往往需要**按固定顺序**给一批对象拍照，并且每张照片要带上
+"在哪、什么时候、谁拍的、拍的是哪一项"这些信息。普通相机做不到这三件事，这个项目把它们串起来了：
+
+```
+选批次 → 选/自动取下一个名字 → 拍摄 → 照片按预设名字命名 + 自动归入批次目录 + 叠加信息水印
+```
+
+## 在原项目基础上新增的能力
+
+| 能力 | 说明 |
+|---|---|
+| **批次拍摄** | 选一个批次，之后每张照片按批次规则命名（`前缀_序号.jpg`）并归入 `Pictures/{目录}/` |
+| **工作模式** | 名字不靠序号，而是**按预设名字列表顺序**取用，如 `设备上架_拖车.jpg`、`设备上架_sn号.jpg` |
+| **轮次归档** | 名字拍完后**自动进入下一轮**，文件落到 `目录/日期/第N轮/`，同一套名字可以反复拍而不冲突 |
+| **逐项拍摄状态** | 支持跳拍（先拍第 3 项，前两项保持"待补拍"）、回头补拍、点已拍项=重拍（自动删掉原照片） |
+| **信息水印** | 多行水印面板：经度 / 纬度 / 地址 / 时间 / 天气 / 备注，字段可开关、字号可调、长文本自动折行 |
+| **拍摄清单** | 一眼看出还差哪几项没拍，点某一项即从该项开始 |
+| **导出清单 CSV** | 导出批次照片清单到「文档」目录，便于交接核对 |
+| **完整设置接线** | 原项目中若干"界面能改但不生效"的设置（照片质量、保存位置、默认滤镜/美颜/HDR、网格、镜像、自动保存等）已全部接通 |
+
+## 构建
+
+```bash
+# 环境：JDK 21 + Android SDK Platform 36 + NDK 27.0.12077973 + CMake 3.22.1
+echo "sdk.dir=/path/to/Android/sdk" > local.properties
+
+./gradlew :app:assembleDebug          # 调试包
+./gradlew :app:assembleRelease        # 正式包（未签名）
+```
+
+ABI 已收窄为 **仅 arm64-v8a**（`app/build.gradle.kts` 与 `core/filter/build.gradle.kts` 两处），
+需要跑模拟器时把 `"x86_64"` 加回去。
+
+### ⚠️ 已知问题：原生源码缺失
+
+`core/filter/src/main/cpp/CMakeLists.txt` 引用了 `gpuimage/yuv-decoder.c`，但**该文件不在本仓库中**
+（上游仓库同样缺失）。当前的处理方式是：
+
+- `CMakeLists.txt` 中该目标改为**按文件是否存在选择性编译**
+- `core/filter/build.gradle.kts` 相应放开了对 gpuimage AAR 自带预编译库的剥离，缺文件时改用官方预编译库
+
+因此**本项目可以正常构建**，代价是 `libyuv-decoder.so` 退回 4KB 页对齐版本
+（该库在本 App 的运行路径中不会被加载）。若你能拿到原作者那份源码，放回该路径即可自动切回 16KB 对齐版本。
+
+## 与原始仓库的差异范围
+
+改动集中在 `app/src/main/kotlin/.../{domain,data,presentation}`、`core/filter/.../WatermarkRenderer.kt`
+以及构建配置；相机的原有能力（CameraX 预览/拍照/录像、滤镜、美颜、人像、夜景、专业模式、
+文档扫描、延时摄影、相册与编辑器）保持原样。
+
+## 测试
+
+```bash
+./gradlew :app:testDebugUnitTest
+```
+
+单测覆盖批次命名与状态机、水印渲染（真实 Canvas 出像素 + 溢出断言）、YUV 转 NV12/NV21 字节一致性。
+UI 层与端到端流程暂无自动化测试。
+
+---
+
+# 原始项目说明（以下内容来自上游 FilterCamera）
 
 # FilterCamera 🎬
 

@@ -69,12 +69,12 @@ android {
             }
         }
 
-        // ABI配置 - 支持主流架构和模拟器
-        // arm64-v8a: 现代ARM设备（主流）
-        // armeabi-v7a: 旧ARM设备（兼容）
-        // x86_64: 模拟器和x86设备（开发调试）
+        // ABI配置
+        // 只构建 arm64-v8a：目标设备都是 64 位 ARM 真机，
+        // 少编两个 ABI 能明显缩短原生构建时间、减小 APK 体积。
+        // 需要跑 x86_64 模拟器时，把 "x86_64" 加回来即可。
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
 
         consumerProguardFiles("consumer-rules.pro")
@@ -142,13 +142,24 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.coroutines.android)
 
-    // GPUImage滤镜库（仅Java类，native库被Transform剥离）
-    // gpuimage的libyuv-decoder.so未对齐16KB
-    // 本模块CMake编译了16KB对齐的替代版本 (src/main/cpp/gpuimage/yuv-decoder.c)
-    api(libs.gpuimage) {
-        // 请求使用剥离 JNI 的版本
-        attributes {
-            attribute(strippedJni, true)
-        }
-    }
+    // GPUImage滤镜库
+    //
+    // 原设计：gpuimage 自带的 libyuv-decoder.so 只对齐到 4KB，
+    // 本模块用 CMake 编译一份 16KB 对齐的替代版本（src/main/cpp/gpuimage/yuv-decoder.c），
+    // 并通过上面的 StripJniLibsTransform 把 AAR 里的旧库剥离掉，避免同名冲突。
+    //
+    // 现状：gpuimage/yuv-decoder.c 不在版本库里（历史提交中也从未存在过），
+    // CMakeLists 那边已按"文件存在与否"跳过该目标。
+    // 这里同步放开对 AAR 的剥离请求，改用 gpuimage 自带的预编译库 ——
+    // 否则会两个库都没有，运行期 System.loadLibrary("yuv-decoder") 直接失败。
+    //
+    // 若把原作者的 yuv-decoder.c 放回去，请把下面 attributes 块的注释一并恢复，
+    // 两处必须成对切换，否则会出现两个 libyuv-decoder.so 争抢同一个文件名。
+    api(libs.gpuimage)
+    // api(libs.gpuimage) {
+    //     // 请求使用剥离 JNI 的版本
+    //     attributes {
+    //         attribute(strippedJni, true)
+    //     }
+    // }
 }

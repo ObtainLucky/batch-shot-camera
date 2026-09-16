@@ -25,11 +25,26 @@ add_library(
 
 # ========== libyuv-decoder.so - GPUImage YUV解码器 ==========
 # 替代gpuimage预编译的libyuv-decoder.so，使用16KB页面对齐
-add_library(
-    yuv-decoder
-    SHARED
-    gpuimage/yuv-decoder.c
-)
+#
+# 注意：gpuimage/yuv-decoder.c 不在版本库里（历史提交中也从未存在过），
+# 因此这里按"文件存在与否"决定是否编译替代版本：
+# - 文件存在（放回原作者的源码）-> 编译 16KB 对齐的替代库，保持原设计
+# - 文件不存在               -> 跳过，改用 gpuimage AAR 自带的预编译库
+#                              （见 core/filter/build.gradle.kts 中 gpuimage 依赖处的说明）
+# 两处必须成对切换，否则会出现两个 libyuv-decoder.so 争抢同一个文件名。
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/gpuimage/yuv-decoder.c")
+    add_library(
+        yuv-decoder
+        SHARED
+        gpuimage/yuv-decoder.c
+    )
+    set(YUV_DECODER_TARGET_BUILT TRUE)
+else()
+    set(YUV_DECODER_TARGET_BUILT FALSE)
+    message(WARNING
+        "gpuimage/yuv-decoder.c 不存在，跳过 16KB 对齐的 libyuv-decoder.so 编译；"
+        "将使用 gpuimage AAR 自带的预编译库（4KB 对齐）。")
+endif()
 
 # 查找NDK系统库
 find_library(
@@ -61,13 +76,15 @@ target_link_libraries(
 )
 
 # 链接库 - yuv-decoder
-target_link_libraries(
-    yuv-decoder
-    ${log-lib}
-    ${jnigraphics-lib}
-    ${android-lib}
-    ${GLESv2-lib}
-)
+if(YUV_DECODER_TARGET_BUILT)
+    target_link_libraries(
+        yuv-decoder
+        ${log-lib}
+        ${jnigraphics-lib}
+        ${android-lib}
+        ${GLESv2-lib}
+    )
+endif()
 
 # 编译选项 - filter
 target_compile_options(
@@ -79,12 +96,14 @@ target_compile_options(
 )
 
 # 编译选项 - yuv-decoder
-target_compile_options(
-    yuv-decoder
-    PRIVATE
-    -Wall
-    -O3
-)
+if(YUV_DECODER_TARGET_BUILT)
+    target_compile_options(
+        yuv-decoder
+        PRIVATE
+        -Wall
+        -O3
+    )
+endif()
 
 # 链接选项 - Android 15 (API 35+) 16KB页面大小对齐
 # 确保Native库在16KB页面设备上正常运行
@@ -94,8 +113,10 @@ target_link_options(
     -Wl,-z,max-page-size=16384
 )
 
-target_link_options(
-    yuv-decoder
-    PRIVATE
-    -Wl,-z,max-page-size=16384
-)
+if(YUV_DECODER_TARGET_BUILT)
+    target_link_options(
+        yuv-decoder
+        PRIVATE
+        -Wl,-z,max-page-size=16384
+    )
+endif()

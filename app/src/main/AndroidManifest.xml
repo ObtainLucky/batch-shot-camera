@@ -36,6 +36,21 @@
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
 
+    <!-- 网络权限（信息水印的天气查询） -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- 定位权限（信息水印的经纬度与地址；未授权时这两行自动省略） -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- 定位是可选能力，无 GPS 设备同样可安装 -->
+    <uses-feature
+        android:name="android.hardware.location"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="false" />
+
     <application
         android:name=".FilterCameraApp"
         android:allowBackup="true"

@@ -47,6 +47,9 @@ mlkitDocumentScanner = "16.0.0-beta1"
 # DataStore
 datastore = "1.1.1"
 
+# kotlinx.serialization（批次配置 JSON 持久化）
+kotlinxSerialization = "1.8.1"
+
 # Coil图片加载
 coil = "2.6.0"
 
@@ -57,6 +60,7 @@ renderscriptToolkit = "b6363490c3"
 junit = "4.13.2"
 junitVersion = "1.2.1"
 espressoCore = "3.6.1"
+robolectric = "4.14.1"
 
 [libraries]
 # AndroidX核心库
@@ -115,6 +119,9 @@ mlkit-document-scanner = { group = "com.google.android.gms", name = "play-servic
 # DataStore持久化
 androidx-datastore-preferences = { group = "androidx.datastore", name = "datastore-preferences", version.ref = "datastore" }
 
+# kotlinx.serialization（批次配置 JSON 序列化）
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+
 # Coil图片加载
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
 
@@ -127,12 +134,15 @@ androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "j
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
 androidx-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
 androidx-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+# Robolectric：在 JVM 上跑真实 Android 图形，用于水印渲染验证（仅单元测试）
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 android-library = { id = "com.android.library", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
 hilt-android = { id = "com.google.dagger.hilt.android", version.ref = "hilt" }
 ksp = { id = "com.google.devtools.ksp", version = "2.3.2" }
 
