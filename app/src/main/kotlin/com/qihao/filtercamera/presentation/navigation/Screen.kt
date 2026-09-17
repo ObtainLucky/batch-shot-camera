@@ -41,6 +41,13 @@ sealed class Screen(val route: String) {
     data object BatchManage : Screen("batch_manage")
 
     /**
+     * 关于页面
+     *
+     * 项目信息、作者与仓库入口，以及"检查更新"（通道为 GitHub Releases）
+     */
+    data object About : Screen("about")
+
+    /**
      * 图片编辑页面
      *
      * 路由格式: edit/{imageUri}

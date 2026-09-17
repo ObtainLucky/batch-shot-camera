@@ -164,7 +164,15 @@ fun NewCameraBottomControls(
     galleryThumbnail: Bitmap?,
     onGalleryClick: () -> Unit,
     onShutterClick: () -> Unit,
-    onSwitchCameraClick: () -> Unit
+    onSwitchCameraClick: () -> Unit,
+    /**
+     * 布局修饰符
+     *
+     * 竖屏传 fillMaxWidth（缩略图/快门/切换均分整行，快门居中，与旧版一致）；
+     * 横屏不传，让整组按内容宽度靠右 —— 否则它会和模式条抢满宽，
+     * 结果就是快门被顶到屏幕正中、模式条被挤没了。
+     */
+    modifier: Modifier = Modifier
 ) {
     val dimens = rememberResponsiveDimens()                               // 响应式尺寸系统
 
@@ -175,71 +183,128 @@ fun NewCameraBottomControls(
     val switchButtonSize = dimens.minTouchTarget                          // 切换按钮尺寸
 
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(
-                horizontal = dimens.spacing.xl,                           // 增加水平边距
-                vertical = dimens.spacing.lg                              // 增加垂直边距
-            ),
+        modifier = modifier.padding(
+            horizontal = dimens.spacing.md,
+            vertical = dimens.spacing.sm
+        ),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Gallery Preview - 相册预览缩略图
-        Box(
-            modifier = Modifier
-                .size(gallerySize)
-                .clip(RoundedCornerShape(dimens.radius.small))
-                .border(
-                    1.5.dp,
-                    CameraTheme.Colors.textSecondary.copy(alpha = 0.5f),  // 减淡边框
-                    RoundedCornerShape(dimens.radius.small)
-                )
-                .background(CameraTheme.Colors.controlBackgroundLight)
-                .clickable(onClick = onGalleryClick),
-            contentAlignment = Alignment.Center
-        ) {
-            if (galleryThumbnail != null) {
-                androidx.compose.foundation.Image(
-                    bitmap = galleryThumbnail.asImageBitmap(),
-                    contentDescription = "相册预览",
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Crop
-                )
-            }
-        }
+        GalleryThumbButton(galleryThumbnail, gallerySize, onGalleryClick)
+        ShutterButton(shutterOuter, shutterInner, dimens.shutterStrokeWidth, onShutterClick)
+        SwitchCameraButton(switchButtonSize, dimens.iconSizeLarge, onSwitchCameraClick)
+    }
+}
 
-        // Shutter Button - 快门按钮（居中）
-        Box(
-            modifier = Modifier
-                .size(shutterOuter)
-                .clip(CircleShape)
-                .border(dimens.shutterStrokeWidth, CameraTheme.Shutter.outer, CircleShape)
-                .padding(dimens.spacing.xs),
-            contentAlignment = Alignment.Center
-        ) {
-            Button(
-                onClick = onShutterClick,
-                modifier = Modifier.size(shutterInner),
-                shape = CircleShape,
-                colors = ButtonDefaults.buttonColors(containerColor = CameraTheme.Shutter.inner)
-            ) {}
-        }
+/**
+ * 竖排的底部控件组（横屏用）
+ *
+ * 横屏可用高度只有 400dp 出头，把这一组压在底边会吃掉三分之一以上的画面，
+ * 所以横屏时整组竖排贴到右边缘（取景框两侧本来就是黑边，正好放控件），
+ * 快门落在右侧中间 —— 各家相机的横屏都是这个位置。
+ */
+@Composable
+fun NewCameraBottomControlsVertical(
+    galleryThumbnail: Bitmap?,
+    onGalleryClick: () -> Unit,
+    onShutterClick: () -> Unit,
+    onSwitchCameraClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val dimens = rememberResponsiveDimens()
+    val gallerySize = dimens.overlayButtonSize + dimens.spacing.md
+    val shutterOuter = dimens.shutterButtonSize
+    val shutterInner = dimens.shutterInnerSize
+    val switchButtonSize = dimens.minTouchTarget
 
-        // Switch Camera Button - 切换镜头按钮
-        IconButton(
-            onClick = onSwitchCameraClick,
-            modifier = Modifier
-                .size(switchButtonSize)
-                .clip(CircleShape)
-                .background(CameraTheme.Colors.controlBackgroundLight)
-        ) {
-            Icon(
-                Icons.Default.Cached,
-                contentDescription = "切换摄像头",
-                tint = CameraTheme.Colors.iconActive,
-                modifier = Modifier.size(dimens.iconSizeLarge)
+    Column(
+        modifier = modifier.padding(vertical = dimens.spacing.sm),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(dimens.spacing.md)
+    ) {
+        // 切换相机在上、快门居中、缩略图在下：单手横持时拇指最顺的位置是快门
+        SwitchCameraButton(switchButtonSize, dimens.iconSizeLarge, onSwitchCameraClick)
+        ShutterButton(shutterOuter, shutterInner, dimens.shutterStrokeWidth, onShutterClick)
+        GalleryThumbButton(galleryThumbnail, gallerySize, onGalleryClick)
+    }
+}
+
+/** 相册预览缩略图 */
+@Composable
+private fun GalleryThumbButton(
+    galleryThumbnail: Bitmap?,
+    size: androidx.compose.ui.unit.Dp,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(RoundedCornerShape(8.dp))
+            .border(
+                1.5.dp,
+                CameraTheme.Colors.textSecondary.copy(alpha = 0.5f),
+                RoundedCornerShape(8.dp)
+            )
+            .background(CameraTheme.Colors.controlBackgroundLight)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        if (galleryThumbnail != null) {
+            androidx.compose.foundation.Image(
+                bitmap = galleryThumbnail.asImageBitmap(),
+                contentDescription = "相册预览",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
             )
         }
+    }
+}
+
+/** 快门按钮 */
+@Composable
+private fun ShutterButton(
+    outer: androidx.compose.ui.unit.Dp,
+    inner: androidx.compose.ui.unit.Dp,
+    strokeWidth: androidx.compose.ui.unit.Dp,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(outer)
+            .clip(CircleShape)
+            .border(strokeWidth, CameraTheme.Shutter.outer, CircleShape)
+            .padding(4.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Button(
+            onClick = onClick,
+            modifier = Modifier.size(inner),
+            shape = CircleShape,
+            colors = ButtonDefaults.buttonColors(containerColor = CameraTheme.Shutter.inner)
+        ) {}
+    }
+}
+
+/** 切换镜头按钮 */
+@Composable
+private fun SwitchCameraButton(
+    size: androidx.compose.ui.unit.Dp,
+    iconSize: androidx.compose.ui.unit.Dp,
+    onClick: () -> Unit
+) {
+    IconButton(
+        onClick = onClick,
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(CameraTheme.Colors.controlBackgroundLight)
+    ) {
+        Icon(
+            Icons.Default.Cached,
+            contentDescription = "切换摄像头",
+            tint = CameraTheme.Colors.iconActive,
+            modifier = Modifier.size(iconSize)
+        )
     }
 }
 
@@ -260,7 +325,8 @@ fun NewCameraBottomControls(
 @Composable
 fun CameraModeSelector(
     currentMode: CameraMode,
-    onModeSelected: (CameraMode) -> Unit
+    onModeSelected: (CameraMode) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val dimens = rememberResponsiveDimens()                               // 响应式尺寸系统
     val modes = CameraMode.getAllModes()                                  // 获取所有模式
@@ -279,7 +345,9 @@ fun CameraModeSelector(
 
     LazyRow(
         state = listState,
-        modifier = Modifier
+        // 注意 modifier 必须放在最前面：横屏时调用方会传 weight，
+        // 若内部无条件 fillMaxWidth，它会独占整行、把右侧的快门挤没
+        modifier = modifier
             .fillMaxWidth()
             .padding(vertical = dimens.spacing.sm)                        // 垂直间距：与预览区保持距离
             .height(dimens.modeSelectorHeight + dimens.spacing.sm),       // 响应式高度（减小以避免遮挡）
@@ -305,6 +373,61 @@ fun CameraModeSelector(
                 )
                 if (isSelected) {
                     Spacer(modifier = Modifier.height(dimens.spacing.xs))
+                    Box(
+                        modifier = Modifier
+                            .size(dimens.modeIndicatorHeight + 2.dp)
+                            .background(CameraTheme.ModeSelector.indicator, CircleShape)
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+/**
+ * 竖排的相机模式选择器（横屏用）
+ *
+ * 横屏时模式条横排会占掉顶部或底部一整条高度，把取景画面压扁；
+ * 竖排贴到左边缘（正好落在取景框左侧的黑边上）就不占画面了。
+ * 各家相机的横屏版式都是这个思路：控件收进两侧，画面保持完整。
+ */
+@Composable
+fun CameraModeSelectorVertical(
+    currentMode: CameraMode,
+    onModeSelected: (CameraMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val dimens = rememberResponsiveDimens()
+    val modes = CameraMode.getAllModes()
+
+    Column(
+        modifier = modifier.padding(vertical = dimens.spacing.sm),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(dimens.spacing.sm)
+    ) {
+        modes.forEach { mode ->
+            val isSelected = mode == currentMode
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable { onModeSelected(mode) }
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = mode.displayName,
+                    color = if (isSelected) {
+                        CameraTheme.ModeSelector.active
+                    } else {
+                        CameraTheme.ModeSelector.inactive
+                    },
+                    fontSize = 12.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                    maxLines = 1
+                )
+                if (isSelected) {
+                    Spacer(modifier = Modifier.height(2.dp))
                     Box(
                         modifier = Modifier
                             .size(dimens.modeIndicatorHeight + 2.dp)

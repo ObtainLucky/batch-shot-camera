@@ -52,7 +52,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -103,6 +105,8 @@ import com.qihao.filtercamera.domain.model.AspectRatio
 import com.qihao.filtercamera.domain.model.HdrMode
 import com.qihao.filtercamera.presentation.common.components.PhotoPreviewDialog
 import com.qihao.filtercamera.presentation.common.components.RoundPickerDialog
+import com.qihao.filtercamera.presentation.camera.components.NewCameraBottomControlsVertical
+import com.qihao.filtercamera.presentation.camera.components.CameraModeSelectorVertical
 import com.qihao.filtercamera.presentation.camera.components.CameraModeSelector
 import com.qihao.filtercamera.presentation.camera.components.BatchBar
 import com.qihao.filtercamera.presentation.camera.components.BatchSelectorSheet
@@ -372,6 +376,60 @@ private fun CameraContent(
             .fillMaxSize()
             .background(CameraTheme.Colors.background)                    // 使用主题背景色
     ) {
+        // 屏幕方向：横竖屏的控件排布完全不同，先算出来
+        val isLandscape = LocalConfiguration.current.orientation ==
+            Configuration.ORIENTATION_LANDSCAPE
+
+        // 横屏时屏幕左右两侧被"模式列 / 控件列"占住，顶部这两条要让开，
+        // 否则工具栏的 ⚙️ 会和变焦叠在一起、批次条的「选择」会压在快门组上。
+        // 让开之后，这两条正好只覆盖取景画面那一块，文字位置也就归位了。
+        val topStartInset = if (isLandscape) 56.dp else dimens.spacing.lg
+        val topEndInset = if (isLandscape) 112.dp else dimens.spacing.lg
+
+        // 横屏：控件收进两侧黑边
+        //
+        // 横屏取景框是 4:3、只占屏幕中间 1440/2400 宽度，两侧各有一条黑边，
+        // 正好用来放控件：画面保持完整不被遮挡，顶部也不会被挤得往下沉。
+        // 快门落在右侧中部 —— 单手横持时拇指最顺的位置。
+        if (isLandscape) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = dimens.spacing.xs)
+            ) {
+                CameraModeSelectorVertical(
+                    currentMode = uiState.mode,
+                    onModeSelected = viewModel::selectMode
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = dimens.spacing.xs),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(dimens.spacing.sm)
+            ) {
+                ZoomIndicator(
+                    currentZoom = uiState.advancedSettings.zoomLevel,
+                    isExpanded = uiState.isZoomSliderVisible,
+                    onClick = viewModel::toggleZoomSlider
+                )
+                NewCameraBottomControlsVertical(
+                    galleryThumbnail = galleryThumbnail,
+                    onGalleryClick = onNavigateToGallery,
+                    onShutterClick = {
+                        if (CameraMode.isVideoMode(uiState.mode)) {
+                            viewModel.toggleRecording()
+                        } else {
+                            viewModel.takePhoto()
+                        }
+                    },
+                    onSwitchCameraClick = viewModel::switchCamera,
+                    modifier = Modifier
+                )
+            }
+        }
+
         // 1. 相机预览容器 - 根据画幅比例调整大小
         //
         // 比例必须跟着屏幕方向换：手机横过来之后，同一个 4:3 画幅在界面上就是 4:3
@@ -389,8 +447,6 @@ private fun CameraContent(
             AspectRatio.RATIO_16_9 -> 9f / 16f                            // 竖屏 宽:高 = 9:16
             AspectRatio.RATIO_FULL -> null                                // 全屏：不限制比例
         }
-        val isLandscape = LocalConfiguration.current.orientation ==
-            Configuration.ORIENTATION_LANDSCAPE
         val previewModifier = if (portraitRatio == null) {
             Modifier.fillMaxSize()                                        // 全屏填满
         } else {
@@ -524,7 +580,12 @@ private fun CameraContent(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
-                .padding(top = dimens.spacing.lg)                         // 响应式顶部间距
+                .padding(
+                    // 横屏可用高度小，顶部多留一点就会把取景画面压扁
+                    top = if (isLandscape) dimens.spacing.xs else dimens.spacing.lg,
+                    start = topStartInset,
+                    end = topEndInset
+                )
         )
 
         // 4. 批次条 - 位于 TopBar 下方，显示当前批次与"下一张"文件名
@@ -545,9 +606,13 @@ private fun CameraContent(
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
                     .padding(
-                        top = dimens.topBarHeight + dimens.spacing.sm,    // 紧贴 TopBar 下方
-                        start = dimens.spacing.lg,
-                        end = dimens.spacing.lg
+                        // 横屏只去掉多余的那一点间隙，仍需排在 TopBar 下方 ——
+                        // 之前压成 spacing.xs 会直接和 TopBar 竖着叠在一起
+                        top = if (isLandscape) dimens.topBarHeight else {
+                            dimens.topBarHeight + dimens.spacing.sm        // 紧贴 TopBar 下方
+                        },
+                        start = topStartInset,
+                        end = topEndInset
                     )
             )
         }
@@ -964,25 +1029,35 @@ private fun CameraContent(
                 }
             }
 
-            // 变焦指示器（位于滤镜选择器下方、模式选择器上方）
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = dimens.spacing.sm),
-                contentAlignment = Alignment.Center
-            ) {
-                ZoomIndicator(
-                    currentZoom = uiState.advancedSettings.zoomLevel,
-                    isExpanded = uiState.isZoomSliderVisible,
-                    onClick = viewModel::toggleZoomSlider
-                )
+            // 变焦指示器
+            //
+            // 竖屏：单独一行，位于滤镜选择器下方、模式选择器上方。
+            // 横屏：并入底部那一行（见下），否则它会浮在画面中间 ——
+            // 横屏可用高度小，上方多一行就把它顶到取景框中间去了。
+            if (!isLandscape) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = dimens.spacing.sm),
+                    contentAlignment = Alignment.Center
+                ) {
+                    ZoomIndicator(
+                        currentZoom = uiState.advancedSettings.zoomLevel,
+                        isExpanded = uiState.isZoomSliderVisible,
+                        onClick = viewModel::toggleZoomSlider
+                    )
+                }
             }
 
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CameraModeSelector(
-                    currentMode = uiState.mode,
-                    onModeSelected = viewModel::selectMode
-                )
+            // 模式选择器 + 底部控制栏
+            //
+            // 竖屏：竖向堆叠（模式条在快门上方的常规排布），此时取景框比屏幕矮，
+            // 控件落在黑边上，不遮挡画面。
+            //
+            // 横屏：**必须排成一行**。横屏可用高度只有 400dp 出头，竖着堆叠要吃掉
+            // 近一半屏幕，快门与模式条会被顶到画面中部 —— 各家相机在横屏下都是
+            // "模式在左、快门在右、沿底边排一行"，这里跟它对齐。
+            val bottomControls: @Composable (Modifier) -> Unit = { controlsModifier ->
                 NewCameraBottomControls(
                     galleryThumbnail = galleryThumbnail,
                     // 打开 App 自己的相册页（网格浏览 / 搜索 / 删除 / 进编辑器）
@@ -999,8 +1074,20 @@ private fun CameraContent(
                             viewModel.takePhoto()
                         }
                     },
-                    onSwitchCameraClick = viewModel::switchCamera
+                    onSwitchCameraClick = viewModel::switchCamera,
+                    modifier = controlsModifier
                 )
+            }
+
+            if (!isLandscape) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CameraModeSelector(
+                        currentMode = uiState.mode,
+                        onModeSelected = viewModel::selectMode
+                    )
+                    // 竖屏保持原样：整行铺满、三项均分、快门居中
+                    bottomControls(Modifier.fillMaxWidth())
+                }
             }
         }
     }

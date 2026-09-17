@@ -9,6 +9,8 @@
  */
 package com.qihao.filtercamera.di
 
+import com.qihao.filtercamera.data.repository.UpdateRepositoryImpl
+import com.qihao.filtercamera.domain.repository.IUpdateRepository
 import com.qihao.filtercamera.data.repository.BatchRepositoryImpl
 import com.qihao.filtercamera.data.repository.CameraRepositoryImpl
 import com.qihao.filtercamera.data.repository.FavoritesRepositoryImpl
@@ -87,4 +89,13 @@ abstract class RepositoryModule {
     abstract fun bindBatchRepository(
         impl: BatchRepositoryImpl
     ): IBatchRepository
+
+    /**
+     * 绑定检查更新仓库
+     */
+    @Binds
+    @Singleton
+    abstract fun bindUpdateRepository(
+        impl: UpdateRepositoryImpl
+    ): IUpdateRepository
 }

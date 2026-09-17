@@ -8,6 +8,7 @@
  */
 package com.qihao.filtercamera.presentation.navigation
 
+import com.qihao.filtercamera.presentation.about.AboutScreen
 import androidx.compose.runtime.Composable
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -66,6 +67,9 @@ fun NavGraph(
                 },
                 onNavigateToBatchManage = {
                     navController.navigate(Screen.BatchManage.route)
+                },
+                onNavigateToAbout = {
+                    navController.navigate(Screen.About.route)
                 }
             )
         }
@@ -73,6 +77,15 @@ fun NavGraph(
         // 批次管理页面
         composable(route = Screen.BatchManage.route) {
             BatchManageScreen(
+                onNavigateBack = {
+                    navController.popBackStack()
+                }
+            )
+        }
+
+        // 关于页面
+        composable(route = Screen.About.route) {
+            AboutScreen(
                 onNavigateBack = {
                     navController.popBackStack()
                 }

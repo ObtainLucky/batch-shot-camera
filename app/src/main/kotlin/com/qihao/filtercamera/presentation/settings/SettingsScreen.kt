@@ -23,6 +23,7 @@
  */
 package com.qihao.filtercamera.presentation.settings
 
+import com.qihao.filtercamera.BuildConfig
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -98,6 +99,7 @@ import com.qihao.filtercamera.domain.repository.VideoQuality
  *
  * @param onNavigateBack 返回回调
  * @param onNavigateToBatchManage 导航到批次管理回调
+ * @param onNavigateToAbout 导航到关于页回调
  * @param viewModel ViewModel 实例
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -105,6 +107,7 @@ import com.qihao.filtercamera.domain.repository.VideoQuality
 fun SettingsScreen(
     onNavigateBack: () -> Unit,                                           // 返回回调
     onNavigateToBatchManage: () -> Unit = {},                             // 批次管理入口
+    onNavigateToAbout: () -> Unit = {},                                   // 关于页入口
     viewModel: SettingsViewModel = hiltViewModel()                        // 注入 ViewModel
 ) {
     val uiState by viewModel.uiState.collectAsState()                     // 收集 UI 状态
@@ -380,7 +383,10 @@ fun SettingsScreen(
                 // 关于
                 item {
                     Spacer(modifier = Modifier.height(8.dp))
-                    AboutSection()
+                    AboutSection(
+                        version = BuildConfig.VERSION_NAME,
+                        onClick = onNavigateToAbout
+                    )
                 }
 
                 // 底部间距
@@ -1017,9 +1023,11 @@ private fun ResetConfirmDialog(
  * 关于部分
  */
 @Composable
-private fun AboutSection() {
+private fun AboutSection(version: String, onClick: () -> Unit) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
         )
@@ -1037,17 +1045,17 @@ private fun AboutSection() {
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "FilterCamera",
+                text = "批次拍摄相机",
                 style = MaterialTheme.typography.titleMedium
             )
             Text(
-                text = "版本 2.0.0",
+                text = "版本 $version",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "实时滤镜相机应用",
+                text = "项目信息、作者与检查更新",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

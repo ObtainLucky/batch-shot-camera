@@ -14,6 +14,7 @@
  */
 package com.qihao.filtercamera.data.watermark
 
+import android.os.Looper
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
@@ -109,7 +110,15 @@ class LocationProvider @Inject constructor(
         val listener = LocationListener { location -> onLocation(location) }
         return try {
             providers.forEach { provider ->
-                manager.requestLocationUpdates(provider, minTimeMs, minDistanceM, listener, null)
+                // 最后一个参数是 Looper。传 null 表示"用**调用线程**的 Looper"，
+                // 而这里是在后台协程（DefaultDispatcher）里调的，没有 Looper，
+                // 于是必然抛 "Can't create handler inside thread ... that has not
+                // called Looper.prepare()"，订阅 100% 失败 —— 持续定位等于从未生效，
+                // 水印里的经纬度一直停在 getLastKnownLocation 的那一个点上。
+                // 回调本身很轻（只更新坐标与时间戳），走主线程即可。
+                manager.requestLocationUpdates(
+                    provider, minTimeMs, minDistanceM, listener, Looper.getMainLooper()
+                )
             }
             updatesListener = listener
             Log.d(TAG, "startUpdates: 已订阅持续定位 providers=$providers, minTime=${minTimeMs}ms")
