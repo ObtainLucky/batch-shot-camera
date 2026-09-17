@@ -15,7 +15,9 @@
  */
 package com.qihao.filtercamera.presentation.camera
 
+import com.qihao.filtercamera.presentation.common.components.BatchFormData
 import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Log
 import androidx.camera.view.PreviewView
 import androidx.lifecycle.LifecycleOwner
@@ -57,6 +59,7 @@ import com.qihao.filtercamera.domain.model.WhiteBalanceMode
 import com.qihao.filtercamera.domain.model.ZoomConfig
 import com.qihao.filtercamera.domain.repository.GridType
 import com.qihao.filtercamera.domain.repository.IBatchRepository
+import com.qihao.filtercamera.domain.repository.IMediaRepository
 import com.qihao.filtercamera.domain.repository.ISettingsRepository
 import com.qihao.filtercamera.domain.usecase.CameraUseCase
 import com.qihao.filtercamera.presentation.camera.components.HistogramCalculator
@@ -107,7 +110,8 @@ class CameraViewModel @Inject constructor(
     private val batchRepository: IBatchRepository,                    // 批次仓库
     private val watermarkInfoProvider: WatermarkInfoProvider,          // 信息水印数据（含持续定位）
     private val settingsRepository: ISettingsRepository,              // 设置仓库（默认值生效用）
-    private val shutterSoundPlayer: ShutterSoundPlayer                // 快门声
+    private val shutterSoundPlayer: ShutterSoundPlayer,               // 快门声
+    private val mediaRepository: IMediaRepository                     // 相册（清单缩略图按文件名找原图）
 ) : ViewModel() {
 
     // ==================== 核心UI状态 ====================
@@ -160,9 +164,17 @@ class CameraViewModel @Inject constructor(
 
     // ==================== 兼容性属性（保持向后兼容） ====================
 
-    // 滤镜预览缩略图缓存（委托给状态管理器）
-    val filterThumbnails: StateFlow<Map<FilterType, Bitmap?>> get() =
-        MutableStateFlow(filterSelectorState.thumbnails)
+    /**
+     * 滤镜预览缩略图缓存（委托给状态管理器）
+     *
+     * 注意这里必须是**同一个** StateFlow 实例：早先写成
+     * `get() = MutableStateFlow(filterSelectorState.thumbnails)`，
+     * 每次读取属性都新建一个流，`collectAsState()` 订阅到的只是一次性快照，
+     * 缩略图后台生成完了界面也收不到 —— 滤镜列表里永远没有预览图。
+     */
+    val filterThumbnails: StateFlow<Map<FilterType, Bitmap?>> = filterSelectorUiState
+        .map { it.thumbnails }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
 
     // 相册最新照片缩略图（小米风格左下角显示）
     private val _galleryThumbnail = MutableStateFlow<Bitmap?>(null)
@@ -298,6 +310,8 @@ class CameraViewModel @Inject constructor(
         observeNightProcessingProgress()                              // 观察夜景处理进度
         observeTimelapseProgress()                                    // 观察延时摄影进度
         observePortraitBlurProgress()                                 // 观察人像虚化处理进度
+        observeRecordingState()                                       // 观察录像状态（以相机事件为准）
+        observeGroupChanges()                                         // 观察分组切换（自动/手动）并提示
         loadInitialGalleryThumbnail()                                 // 加载初始相册缩略图
         // 相机页可见期间持续订阅定位，让水印里的经纬度跟着人走
         watermarkInfoProvider.startLiveUpdates()
@@ -441,6 +455,24 @@ class CameraViewModel @Inject constructor(
                 )
             }
         }
+    }
+
+    /**
+     * 观察录像状态
+     *
+     * 以 CameraRepositoryImpl 的真实录像事件为准（VideoRecordEvent.Start / Finalize），
+     * 而不是在调用 startRecording 时乐观置位 —— 后者在录像启动失败时会让
+     * 按钮永远停在"录制中"，用户只能杀进程。
+     */
+    private fun observeRecordingState() = viewModelScope.launch {
+        useCase.isRecording()
+            .catch { Log.w(TAG, "observeRecordingState: 观察录像状态失败", it) }
+            .collect { recording ->
+                if (_uiState.value.isRecording != recording) {
+                    Log.d(TAG, "observeRecordingState: isRecording=$recording")
+                    _uiState.update { it.copy(isRecording = recording) }
+                }
+            }
     }
 
     /**
@@ -621,9 +653,22 @@ class CameraViewModel @Inject constructor(
      */
     fun bindCamera(owner: LifecycleOwner, previewView: PreviewView) = viewModelScope.launch {
         try {
-            Log.d(TAG, "bindCamera: 开始绑定相机")
-            useCase.bindCamera(owner, previewView)
+            Log.d(TAG, "bindCamera: 开始绑定相机 mode=${_uiState.value.mode.displayName}")
+            // 明确告知本次绑定的模式：相机仓库是单例，会记住上一次的模式，
+            // 不显式覆盖就可能"界面是拍照、底层绑的是录像用例"，快门直接失效
+            useCase.bindCamera(owner, previewView, CameraMode.isVideoMode(_uiState.value.mode))
             Log.d(TAG, "bindCamera: 相机绑定成功")
+
+            // 同上，这个标志也在单例里，按当前模式重置一次，
+            // 免得上一轮人像/文档模式留下的 true 让分析帧白转一整个会话
+            val mode = _uiState.value.mode
+            useCase.setAnalysisConsumerActive(
+                mode == CameraMode.PORTRAIT || mode == CameraMode.DOCUMENT
+            )
+
+            // 重绑会换掉 CameraControl，专业模式的 Camera2 请求选项随之丢失。
+            // 把面板上的参数重发一遍，保证"界面显示什么，相机就按什么拍"。
+            proModeState.reapplyToCamera()
         } catch (e: Exception) {
             Log.e(TAG, "bindCamera: 相机绑定失败", e)
             _events.emit(CameraEvent.Error(e.message ?: "相机绑定失败"))
@@ -808,17 +853,19 @@ class CameraViewModel @Inject constructor(
      * 新建后自动选中符合"选批次 -> 拍摄"的操作直觉，
      * 免得用户建完还要再点一次。
      */
-    fun createBatch(
-        name: String,
-        dirName: String,
-        namePrefix: String,
-        startIndex: Int = BatchConfig.DEFAULT_START_INDEX,
-        indexWidth: Int = BatchConfig.DEFAULT_INDEX_WIDTH,
-        dateSubDir: Boolean = false,
-        namingMode: NamingMode = NamingMode.SEQUENCE,
-        nameList: List<String> = emptyList(),
-        note: String = ""
-    ) = viewModelScope.launch {
+    fun createBatch(data: BatchFormData) = viewModelScope.launch {
+        val name = data.name
+        val dirName = data.dirName
+        val namePrefix = data.prefix
+        val startIndex = data.startIndex
+        val indexWidth = data.indexWidth
+        val dateSubDir = data.dateSubDir
+        val namingMode = data.namingMode
+        val nameList = data.nameList
+        val note = data.note
+        val groupNames = data.groupNames
+        val autoAdvanceGroup = data.autoAdvanceGroup
+        val includeGroupInFileName = data.includeGroupInFileName
         // 目录名冲突会让两批照片落进同一个相册，这里直接拦住
         val conflicts = batches.value.firstOrNull {
             it.safeDirName.equals(dirName.trim(), ignoreCase = true)
@@ -836,14 +883,28 @@ class CameraViewModel @Inject constructor(
             startIndex = startIndex,
             indexWidth = indexWidth,
             dateSubDir = dateSubDir
-        ).copy(namingMode = namingMode, nameList = nameList, note = note.trim()).normalized()
+        ).copy(
+            namingMode = namingMode,
+            nameList = nameList,
+            note = note.trim(),
+            // 组名必须逐个清洗：它会直接变成目录名，带 / 或非法字符会生成奇怪的层级
+            groupNames = groupNames.map { BatchConfig.sanitizeGroupName(it) }.filter { it.isNotEmpty() },
+            autoAdvanceGroup = autoAdvanceGroup,
+            includeGroupInFileName = includeGroupInFileName
+        ).normalized()
         batchRepository.addBatch(batch)
             .onSuccess {
-                Log.d(TAG, "createBatch: 新建成功 name=${batch.name}, id=${batch.id}")
+                Log.d(TAG, "createBatch: 新建成功 name=${batch.name}, id=${batch.id}, " +
+                    "分组=${batch.groupNames}")
                 batchRepository.selectBatch(batch.id).onFailure { error ->
                     Log.e(TAG, "createBatch: 新建后自动选中失败 id=${batch.id}", error)
                 }
-                _events.emit(CameraEvent.Info("批次「${batch.name}」已创建，下一张 ${batch.nextFileName()}"))
+                val groupHint = batch.activeGroupName?.let { "，当前组 $it" } ?: ""
+                _events.emit(
+                    CameraEvent.Info(
+                        "批次「${batch.name}」已创建$groupHint，下一张 ${batch.nextFileName()}"
+                    )
+                )
             }
             .onFailure { error ->
                 Log.e(TAG, "createBatch: 新建失败", error)
@@ -940,14 +1001,6 @@ class CameraViewModel @Inject constructor(
     val isShotListVisible: StateFlow<Boolean> = _isShotListVisible.asStateFlow()
 
     /**
-     * 打开/关闭拍摄清单
-     */
-    fun showShotList(visible: Boolean) {
-        Log.d(TAG, "showShotList: visible=$visible")
-        _isShotListVisible.value = visible
-    }
-
-    /**
      * 在清单里选择某一项
      *
      * - 未拍过 -> 直接跳过去拍（跳过的项保持未拍，后续会自动回头补拍）
@@ -999,6 +1052,174 @@ class CameraViewModel @Inject constructor(
     }
 
     /**
+     * 切换到某一组（相机页组标签栏）
+     */
+    fun selectGroup(index: Int) = viewModelScope.launch {
+        val batch = currentBatch.value
+        if (batch == null) {
+            _events.emit(CameraEvent.Error("没有选中批次"))
+            return@launch
+        }
+        if (!batch.usesGroups) return@launch
+
+        batchRepository.setActiveGroup(batch.id, index)
+            .onFailure { error ->
+                Log.e(TAG, "selectGroup: 切组失败", error)
+                _events.emit(CameraEvent.Error("切换分组失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 跳到指定轮次
+     */
+    fun selectRound(round: Int) = viewModelScope.launch {
+        val batch = currentBatch.value
+        if (batch == null) {
+            _events.emit(CameraEvent.Error("没有选中批次"))
+            return@launch
+        }
+        batchRepository.setRound(batch.id, round)
+            .onSuccess {
+                val target = batch.withRound(round)
+                val total = target.effectiveNameList.size
+                Log.d(TAG, "selectRound: 已跳到第 $round 轮")
+                _events.emit(
+                    CameraEvent.Info(
+                        "已跳到第 $round 轮" +
+                            (if (total > 0) "，已拍 ${target.shotCount}/$total" else "") +
+                            "，下一张 ${target.nextFileName()}"
+                    )
+                )
+            }
+            .onFailure { error ->
+                Log.e(TAG, "selectRound: 跳转失败", error)
+                _events.emit(CameraEvent.Error("切换轮次失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    /**
+     * 轮次选择弹窗是否可见
+     */
+    private val _isRoundPickerVisible = MutableStateFlow(false)
+    val isRoundPickerVisible: StateFlow<Boolean> = _isRoundPickerVisible.asStateFlow()
+
+    /** 打开轮次选择弹窗 */
+    fun showRoundPicker(visible: Boolean) {
+        Log.d(TAG, "showRoundPicker: visible=$visible")
+        _isRoundPickerVisible.value = visible
+    }
+
+    /**
+     * 清空当前轮进度并回到第 1 轮
+     *
+     * 与「重拍本轮」的区别：那个只清当前轮，这个连轮次一起归 1。
+     */
+    fun resetRoundToFirst() = viewModelScope.launch {
+        val batch = currentBatch.value
+        if (batch == null) {
+            _events.emit(CameraEvent.Error("没有选中批次"))
+            return@launch
+        }
+        _isRoundPickerVisible.value = false
+        batchRepository.resetRound(batch.id)
+            .onSuccess {
+                val reset = batch.withRoundReset()
+                Log.d(TAG, "resetRoundToFirst: 已回到第 1 轮")
+                _events.emit(
+                    CameraEvent.Info("已回到第 1 轮，下一张 ${reset.nextFileName()}")
+                )
+            }
+            .onFailure { error ->
+                Log.e(TAG, "resetRoundToFirst: 失败", error)
+                _events.emit(CameraEvent.Error("重置轮次失败：${error.message ?: "未知错误"}"))
+            }
+    }
+
+    // ==================== 拍摄清单缩略图 ====================
+
+    /**
+     * 清单里各项对应的照片 Uri（下标 -> Uri）
+     *
+     * 打开清单时按文件名去相册里找：现场要能一眼看出"这一张是不是拍错了"，
+     * 所以每项右侧给个缩略图，点开可放大核对。
+     */
+    private val _shotListThumbs = MutableStateFlow<Map<Int, Uri>>(emptyMap())
+    val shotListThumbs: StateFlow<Map<Int, Uri>> = _shotListThumbs.asStateFlow()
+
+    /**
+     * 打开/关闭拍摄清单
+     *
+     * 打开时顺带把各已拍项的照片找出来（缩略图 + 点开核对）。
+     */
+    fun showShotList(visible: Boolean) {
+        _isShotListVisible.value = visible
+        if (visible) {
+            loadShotListThumbnails()
+        } else {
+            _shotListThumbs.value = emptyMap()
+        }
+    }
+
+    private fun loadShotListThumbnails() = viewModelScope.launch {
+        val batch = currentBatch.value ?: return@launch
+        val names = batch.effectiveNameList
+        if (names.isEmpty()) {
+            _shotListThumbs.value = emptyMap()
+            return@launch
+        }
+
+        try {
+            val files = mediaRepository.getPhotosInDir(batch.safeDirName)
+            val byName = files.associateBy({ it.name }, { it.uri })
+            val result = mutableMapOf<Int, Uri>()
+            names.indices.forEach { index ->
+                if (!batch.isNameShot(index)) return@forEach
+                val diskName = batch.findDiskNameFor(index, files.map { it.name })
+                    ?: return@forEach
+                byName[diskName]?.let { result[index] = it }
+            }
+            Log.d(TAG, "loadShotListThumbnails: 找到 ${result.size}/${batch.shotCount} 张缩略图")
+            _shotListThumbs.value = result
+        } catch (e: Exception) {
+            Log.e(TAG, "loadShotListThumbnails: 加载失败", e)
+            _shotListThumbs.value = emptyMap()
+        }
+    }
+
+    /**
+     * 观察分组变化并给出提示
+     *
+     * 有两种来源：一组拍完自动切到下一组（这时要说清楚"上一组拍完了、现在在哪组"），
+     * 以及用户手动点组标签。两者都给一次提示，避免"拍着拍着发现存到别的目录了"。
+     */
+    private fun observeGroupChanges() = viewModelScope.launch {
+        var previous: BatchConfig? = null
+        currentBatch.collect { batch ->
+            val prev = previous
+            previous = batch
+            if (batch == null || prev == null || prev.id != batch.id) return@collect
+
+            val prevGroup = prev.activeGroupName
+            val newGroup = batch.activeGroupName
+            if (prevGroup == newGroup) return@collect
+
+            val total = batch.effectiveNameList.size
+            val message = buildString {
+                if (prev.isRoundComplete && prevGroup != null) {
+                    append("「").append(prevGroup).append("」已拍完，")
+                }
+                append("已切到「").append(newGroup ?: "默认").append("」")
+                if (total > 0) {
+                    append("，已拍 ").append(batch.shotCount).append("/").append(total)
+                }
+                append("，下一张 ").append(batch.nextFileName())
+            }
+            Log.d(TAG, "observeGroupChanges: $message")
+            _events.emit(CameraEvent.Info(message))
+        }
+    }
+
+    /**
      * 切换批次切换弹窗
      */
     fun toggleBatchSheet() {
@@ -1036,8 +1257,10 @@ class CameraViewModel @Inject constructor(
 
     private suspend fun startRecording() {
         Log.d(TAG, "startRecording: 开始录像")
+        // 不在这里乐观地置 isRecording=true：录像是异步的，真正开录由
+        // CameraRepositoryImpl 的 VideoRecordEvent.Start 事件驱动，
+        // 再经 observeRecordingState 回填。否则失败时按钮会一直停在"录制中"。
         useCase.startRecording()
-            .onSuccess { _uiState.update { it.copy(isRecording = true) } }
             .onFailure { error ->
                 Log.e(TAG, "startRecording: 开始录像失败", error)
                 _events.emit(CameraEvent.Error(error.message ?: "开始录像失败"))
@@ -1049,12 +1272,10 @@ class CameraViewModel @Inject constructor(
         useCase.stopRecording()
             .onSuccess { uri ->
                 Log.d(TAG, "stopRecording: 录像保存成功 uri=$uri")
-                _uiState.update { it.copy(isRecording = false) }
                 _events.emit(CameraEvent.VideoRecorded(uri.toString()))
             }
             .onFailure { error ->
                 Log.e(TAG, "stopRecording: 停止录像失败", error)
-                _uiState.update { it.copy(isRecording = false) }
                 _events.emit(CameraEvent.Error(error.message ?: "停止录像失败"))
             }
     }
@@ -1235,6 +1456,25 @@ class CameraViewModel @Inject constructor(
         }
 
         _uiState.update { it.copy(mode = mode) }
+
+        // 人像/文档的叠加层要靠分析帧位图做检测，进入这类模式时告诉相机仓库
+        // "有人在消费"，否则美颜为 0 且无滤镜时分析帧会被当成没人要而丢弃，
+        // 人脸框/文档框就冻在最后一帧上
+        useCase.setAnalysisConsumerActive(
+            mode == CameraMode.PORTRAIT || mode == CameraMode.DOCUMENT
+        )
+
+        // 拍照与录像的用例组合在 CameraX 里是互斥资源（四用例同绑只有 FULL 级设备支持），
+        // 所以切到录像/拍照时要重绑一次，否则录像是绑不上 VideoCapture 的。
+        viewModelScope.launch {
+            useCase.setVideoMode(CameraMode.isVideoMode(mode))
+                .onFailure { error ->
+                    Log.e(TAG, "selectMode: 切换拍照/录像绑定失败", error)
+                    _events.emit(
+                        CameraEvent.Error("切换模式失败：${error.message ?: "未知错误"}")
+                    )
+                }
+        }
     }
 
     // ==================== 夜景模式配置 ====================

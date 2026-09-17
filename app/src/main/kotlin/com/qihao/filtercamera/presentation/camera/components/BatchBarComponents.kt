@@ -16,6 +16,7 @@ package com.qihao.filtercamera.presentation.camera.components
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,16 +27,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import android.net.Uri
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOff
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -53,13 +60,18 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.qihao.filtercamera.domain.model.BatchConfig
 import com.qihao.filtercamera.domain.model.NamingMode
 import com.qihao.filtercamera.presentation.common.components.BatchFormFields
+import com.qihao.filtercamera.presentation.common.components.BatchFormData
 import com.qihao.filtercamera.presentation.common.theme.CameraTheme
 import kotlinx.coroutines.launch
 
@@ -80,10 +92,162 @@ fun BatchBar(
     canUndoLastShot: Boolean = false,
     onUndoLastShot: () -> Unit = {},
     onOpenShotList: () -> Unit = {},
+    onSelectGroup: (Int) -> Unit = {},
+    onOpenRoundPicker: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        BatchBarRow(
+            current = current,
+            onClick = onClick,
+            canUndoLastShot = canUndoLastShot,
+            onUndoLastShot = onUndoLastShot,
+            onOpenShotList = onOpenShotList
+        )
+
+        // 拍摄位置条：组标签 + 轮次。
+        //
+        // 「组」和「轮次」是同一个问题的两个轴（"在哪一组、这一组的第几遍"），
+        // 所以并排放在批次条下面这一行里：现场是"拍完这组立刻切下一组"、
+        // "第 2 轮拍一半被叫去拍第 3 轮"的节奏，两个切换都必须一步可达，
+        // 不能藏进设置页。
+        //
+        // 轮次固定在右侧不参与滚动：组多的时候不能把轮次挤到看不见。
+        if (current != null && current.isWorkMode && current.effectiveNameList.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (current.usesGroups) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        GroupTabs(current = current, onSelectGroup = onSelectGroup)
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                } else {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+                RoundChip(current = current, onClick = onOpenRoundPicker)
+            }
+        }
+    }
+}
+
+/**
+ * 轮次标签（常驻显示，点开可跳到任意轮次）
+ *
+ * 只有一轮时也显示：现场看得到"现在是第 1 轮"本身就有用，
+ * 而且入口常驻才不需要先想"到哪儿切"。
+ */
+@Composable
+private fun RoundChip(current: BatchConfig, onClick: () -> Unit) {
+    val round = current.round.coerceAtLeast(1)
+    val total = current.effectiveNameList.size
+    val done = current.shotCount >= total && total > 0
+
     Row(
-        modifier = modifier
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(CameraTheme.Colors.controlBackground)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 5.dp)
+    ) {
+        if (done) {
+            Icon(
+                imageVector = Icons.Default.Check,
+                contentDescription = null,
+                tint = CameraTheme.Colors.success,
+                modifier = Modifier.size(12.dp)
+            )
+            Spacer(modifier = Modifier.width(3.dp))
+        }
+        Text(
+            text = "第${round}轮",
+            color = CameraTheme.Colors.textPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+        Icon(
+            imageVector = Icons.Default.ArrowDropDown,
+            contentDescription = "切换轮次",
+            tint = CameraTheme.Colors.iconInactive,
+            modifier = Modifier.size(16.dp)
+        )
+    }
+}
+
+/**
+ * 分组标签栏
+ *
+ * 每组显示「组名 + 已拍/总数」，拍完的打勾，当前组高亮。
+ */
+@Composable
+private fun GroupTabs(
+    current: BatchConfig,
+    onSelectGroup: (Int) -> Unit
+) {
+    val total = current.effectiveNameList.size
+    val activeIndex = current.safeActiveGroupIndex
+
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        itemsIndexed(current.groupNames) { index, name ->
+            val shot = current.groupShotCountOf(name)
+            val isDone = total > 0 && shot >= total
+            val isActive = index == activeIndex
+
+            val background = when {
+                isActive -> CameraTheme.Colors.primary
+                else -> CameraTheme.Colors.controlBackground
+            }
+            val textColor = if (isActive) Color.Black else CameraTheme.Colors.textPrimary
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(background)
+                    .clickable { onSelectGroup(index) }
+                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            ) {
+                if (isDone) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        tint = if (isActive) Color.Black else CameraTheme.Colors.success,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Spacer(modifier = Modifier.width(3.dp))
+                }
+                Text(
+                    text = if (total > 0) "$name $shot/$total" else name,
+                    color = textColor,
+                    fontSize = 12.sp,
+                    fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 批次条主体
+ */
+@Composable
+private fun BatchBarRow(
+    current: BatchConfig?,
+    onClick: () -> Unit,
+    canUndoLastShot: Boolean,
+    onUndoLastShot: () -> Unit,
+    onOpenShotList: () -> Unit
+) {
+    Row(
+        modifier = Modifier
             .fillMaxWidth()
             .background(CameraTheme.Colors.controlBackground, RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
@@ -114,7 +278,9 @@ fun BatchBar(
                         // 拍完会自动进入下一轮，这里直接展示下一张（新一轮的第一个名字）
                         append("下一张: ").append(current.nextFileName())
                         append(" · ")
-                        append(current.workProgressLabel ?: "已拍 ${current.counter} 张")
+                        // progressSummary 内部按模式区分：序号模式看计数器，
+                        // 工作模式看本轮已拍项数（两者不能混用同一个字段）
+                        append(current.progressSummary)
                     }
                 } else {
                     "点此选择批次，自动命名并归档"
@@ -176,7 +342,7 @@ fun BatchSelectorSheet(
     currentBatchId: String?,
     onSelect: (String) -> Unit,
     onClear: () -> Unit,
-    onCreate: (String, String, String, Int, Int, Boolean, NamingMode, List<String>, String) -> Unit,
+    onCreate: (BatchFormData) -> Unit,
     onDismiss: () -> Unit
 ) {
     if (!visible) return
@@ -202,13 +368,9 @@ fun BatchSelectorSheet(
             CreateBatchForm(
                 existingBatches = batches,
                 onCancel = { showCreateForm = false },
-                onConfirm = { name, dirName, prefix, startIndex, indexWidth, dateSubDir,
-                               mode, listText, noteText ->
-                    // namingMode / nameListText / note 由 CreateBatchForm 内部维护，这里只透传
-                    onCreate(
-                        name, dirName, prefix, startIndex, indexWidth, dateSubDir,
-                        mode, BatchConfig.parseNameList(listText), noteText
-                    )
+                onConfirm = { form ->
+                    // 表单内容由 CreateBatchForm 内部维护，这里只透传
+                    onCreate(form)
                     // 动作失败时 ViewModel 会抛错误提示，弹窗保持打开让用户重试；
                     // 成功则由这里收起，带下滑动画
                     dismissWithAnimation()
@@ -364,7 +526,7 @@ private fun BatchListItem(
             )
             Text(
                 text = "下一张 ${batch.nextFileName()} · " +
-                    (batch.workProgressLabel ?: "已拍 ${batch.counter} 张") +
+                    batch.progressSummary +
                     " · Pictures/${batch.safeDirName}/",
                 style = MaterialTheme.typography.bodySmall,
                 color = CameraTheme.Colors.textSecondary,
@@ -399,6 +561,8 @@ fun ShotListSheet(
     visible: Boolean,
     batch: BatchConfig?,
     onJumpTo: (Int) -> Unit,
+    onPreview: (Uri, String) -> Unit = { _, _ -> },
+    thumbUris: Map<Int, Uri> = emptyMap(),
     onDismiss: () -> Unit
 ) {
     if (!visible || batch == null) return
@@ -406,6 +570,7 @@ fun ShotListSheet(
     val names = batch.effectiveNameList
     if (names.isEmpty()) return
 
+    val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     val dismissWithAnimation: () -> Unit = {
@@ -430,8 +595,11 @@ fun ShotListSheet(
                 fontWeight = FontWeight.Bold
             )
             Text(
-                text = "第 ${batch.round} 轮 · 已拍 ${batch.shotCount}/${names.size}" +
-                    " · 下一张：${batch.nextFileName()}",
+                text = buildString {
+                    batch.activeGroupName?.let { append("$it · ") }
+                    append("第 ${batch.round} 轮 · 已拍 ${batch.shotCount}/${names.size}")
+                    append(" · 下一张：${batch.nextFileName()}")
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = CameraTheme.Colors.textSecondary
             )
@@ -483,6 +651,26 @@ fun ShotListSheet(
                                 color = CameraTheme.Colors.textSecondary
                             )
                         }
+
+                        // 右侧缩略图：现场要能一眼看出这张拍错没有，点开可看大图。
+                        // 只对"已拍且找得到原图"的项显示，避免给用户一个空框
+                        thumbUris[index]?.let { thumb ->
+                            Spacer(modifier = Modifier.width(8.dp))
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(thumb)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = "查看大图",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        onPreview(thumb, batch.buildCustomFileName(name))
+                                    }
+                            )
+                        }
                     }
                 }
             }
@@ -510,7 +698,7 @@ fun ShotListSheet(
 private fun CreateBatchForm(
     existingBatches: List<BatchConfig>,
     onCancel: () -> Unit,
-    onConfirm: (String, String, String, Int, Int, Boolean, NamingMode, String, String) -> Unit
+    onConfirm: (BatchFormData) -> Unit
 ) {
     // 依据已有批次推导建议值：BatchA -> 下一个 BatchB
     val suggestion = remember(existingBatches) { BatchConfig.suggestNextNaming(existingBatches) }
@@ -523,6 +711,9 @@ private fun CreateBatchForm(
     var dateSubDir by remember { mutableStateOf(false) }
     var namingMode by remember { mutableStateOf(NamingMode.SEQUENCE) }
     var nameListText by remember { mutableStateOf("") }
+    var groupNamesText by remember { mutableStateOf("") }
+    var autoAdvanceGroup by remember { mutableStateOf(true) }
+    var includeGroupInFileName by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf("") }
 
     val dirError = BatchConfig.validateDirName(dirName)
@@ -583,6 +774,12 @@ private fun CreateBatchForm(
                 onNamingModeChange = { namingMode = it },
                 nameListText = nameListText,
                 onNameListTextChange = { nameListText = it },
+                groupNamesText = groupNamesText,
+                onGroupNamesTextChange = { groupNamesText = it },
+                autoAdvanceGroup = autoAdvanceGroup,
+                onAutoAdvanceGroupChange = { autoAdvanceGroup = it },
+                includeGroupInFileName = includeGroupInFileName,
+                onIncludeGroupInFileNameChange = { includeGroupInFileName = it },
                 note = note,
                 onNoteChange = { note = it },
                 copyableBatches = existingBatches,
@@ -614,17 +811,23 @@ private fun CreateBatchForm(
             Button(
                 onClick = {
                     onConfirm(
-                        name.trim(),
-                        dirName.trim(),
-                        prefix.trim(),
-                        startIndex.toIntOrNull() ?: BatchConfig.DEFAULT_START_INDEX,
-                        indexWidth.toIntOrNull()
-                            ?.coerceIn(BatchConfig.MIN_INDEX_WIDTH, BatchConfig.MAX_INDEX_WIDTH)
-                            ?: BatchConfig.DEFAULT_INDEX_WIDTH,
-                        dateSubDir,
-                        namingMode,
-                        nameListText,
-                        note
+                        BatchFormData(
+                            name = name.trim(),
+                            dirName = dirName.trim(),
+                            prefix = prefix.trim(),
+                            startIndex = startIndex.toIntOrNull()
+                                ?: BatchConfig.DEFAULT_START_INDEX,
+                            indexWidth = indexWidth.toIntOrNull()
+                                ?.coerceIn(BatchConfig.MIN_INDEX_WIDTH, BatchConfig.MAX_INDEX_WIDTH)
+                                ?: BatchConfig.DEFAULT_INDEX_WIDTH,
+                            dateSubDir = dateSubDir,
+                            namingMode = namingMode,
+                            nameList = BatchConfig.parseNameList(nameListText),
+                            note = note,
+                            groupNames = BatchConfig.parseNameList(groupNamesText),
+                            autoAdvanceGroup = autoAdvanceGroup,
+                            includeGroupInFileName = includeGroupInFileName
+                        )
                     )
                 },
                 enabled = canSubmit,

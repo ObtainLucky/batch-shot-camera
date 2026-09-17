@@ -83,9 +83,19 @@ interface IBatchRepository {
     suspend fun advanceAfterShot(id: String): Result<Unit>
 
     /**
-     * 重置已拍张数（回到起始序号，用于重拍整批）
+     * 重置进度（回到本轮的起点，用于重拍本轮）
+     *
+     * 工作模式要清掉的是"已拍下标 + 名字指针"，不能只把 counter 归零。
      */
     suspend fun resetCounter(id: String): Result<Unit>
+
+    /**
+     * 轮次归 1 并清空进度
+     *
+     * [startNewRound] 只会 +1，轮次因此只增不减；跨天复用同一批次时会一路延续
+     * （当天目录里直接是「第N轮」），需要这个显式归位。
+     */
+    suspend fun resetRound(id: String): Result<Unit>
 
     /**
      * 开始新一轮：轮次 +1 并把名字序号归零
@@ -102,6 +112,22 @@ interface IBatchRepository {
      * 下标会自动夹到合法区间。
      */
     suspend fun setNamePointer(id: String, index: Int): Result<Unit>
+
+    /**
+     * 跳到指定轮次
+     *
+     * 每轮各自保留进度：第 2 轮拍到一半被打断、跳去第 3 轮，回来时第 2 轮还在原处。
+     */
+    suspend fun setRound(id: String, round: Int): Result<Unit>
+
+    /**
+     * 切换到指定分组
+     *
+     * 切走前保存当前组进度、切回来时恢复，所以来回切不会丢已拍记录。
+     *
+     * @param index 目标组下标（自动夹到合法区间）
+     */
+    suspend fun setActiveGroup(id: String, index: Int): Result<Unit>
 
     /**
      * 标记某一项需要重拍：把它从"已拍"里移除并把指针指过去

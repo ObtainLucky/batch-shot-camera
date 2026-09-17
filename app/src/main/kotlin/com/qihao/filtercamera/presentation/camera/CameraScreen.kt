@@ -26,6 +26,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -85,6 +86,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -99,6 +101,8 @@ import com.qihao.filtercamera.domain.model.CameraMode
 import com.qihao.filtercamera.domain.model.FilterType
 import com.qihao.filtercamera.domain.model.AspectRatio
 import com.qihao.filtercamera.domain.model.HdrMode
+import com.qihao.filtercamera.presentation.common.components.PhotoPreviewDialog
+import com.qihao.filtercamera.presentation.common.components.RoundPickerDialog
 import com.qihao.filtercamera.presentation.camera.components.CameraModeSelector
 import com.qihao.filtercamera.presentation.camera.components.BatchBar
 import com.qihao.filtercamera.presentation.camera.components.BatchSelectorSheet
@@ -350,6 +354,10 @@ private fun CameraContent(
     // 作废上一张的可用性与确认框（删除照片不可撤销，必须二次确认）
     val canUndoLastShot by viewModel.canUndoLastShot.collectAsState()
     val isShotListVisible by viewModel.isShotListVisible.collectAsState()
+    val shotListThumbs by viewModel.shotListThumbs.collectAsState()
+    val isRoundPickerVisible by viewModel.isRoundPickerVisible.collectAsState()
+    // 清单里点开的照片（uri + 文件名），非空即显示全屏预览
+    var previewUri by remember { mutableStateOf<Pair<Uri, String>?>(null) }
     var showUndoConfirm by remember { mutableStateOf(false) }
     // 待确认重拍的名字下标（会删除原照片，所以先问一下）
     var pendingReshootIndex by remember { mutableStateOf<Int?>(null) }
@@ -365,26 +373,32 @@ private fun CameraContent(
             .background(CameraTheme.Colors.background)                    // 使用主题背景色
     ) {
         // 1. 相机预览容器 - 根据画幅比例调整大小
-        // 计算预览区域的修饰符
-        val previewModifier = when (uiState.advancedSettings.aspectRatio) {
-            AspectRatio.RATIO_1_1 -> Modifier
-                .fillMaxWidth()
-                .aspectRatio(1f)                                          // 1:1 正方形
+        //
+        // 比例必须跟着屏幕方向换：手机横过来之后，同一个 4:3 画幅在界面上就是 4:3
+        // （宽>高），而不是竖屏时的 3:4。原来写死竖屏比例 + fillMaxWidth，
+        // 横屏下高度会算成屏幕宽度的 4/3 倍，直接把预览撑出屏幕、控件全被挤走。
+        //
+        // 这里不再用 fillMaxWidth，改成只用 aspectRatio：它会自动挑一个
+        // "在约束内尽可能大且符合比例"的尺寸（宽放不下就改按高来算），
+        // 竖屏横屏都成立。
+        val targetRatio = uiState.advancedSettings.aspectRatio
+        val portraitRatio: Float? = when (targetRatio) {
+            AspectRatio.RATIO_1_1 -> 1f                                   // 1:1 两个方向相同
+            AspectRatio.RATIO_3_2 -> 2f / 3f                              // 竖屏 宽:高 = 2:3
+            AspectRatio.RATIO_4_3 -> 3f / 4f                              // 竖屏 宽:高 = 3:4
+            AspectRatio.RATIO_16_9 -> 9f / 16f                            // 竖屏 宽:高 = 9:16
+            AspectRatio.RATIO_FULL -> null                                // 全屏：不限制比例
+        }
+        val isLandscape = LocalConfiguration.current.orientation ==
+            Configuration.ORIENTATION_LANDSCAPE
+        val previewModifier = if (portraitRatio == null) {
+            Modifier.fillMaxSize()                                        // 全屏填满
+        } else {
+            // 横屏时取倒数，把"竖屏的宽:高"换成"横屏的宽:高"
+            val displayRatio = if (isLandscape) 1f / portraitRatio else portraitRatio
+            Modifier
+                .aspectRatio(displayRatio)
                 .align(Alignment.Center)
-            AspectRatio.RATIO_3_2 -> Modifier
-                .fillMaxWidth()
-                .aspectRatio(2f / 3f)                                     // 3:2 竖屏 = 宽:高 = 2:3
-                .align(Alignment.Center)
-            AspectRatio.RATIO_4_3 -> Modifier
-                .fillMaxWidth()
-                .aspectRatio(3f / 4f)                                     // 4:3 竖屏 = 宽:高 = 3:4
-                .align(Alignment.Center)
-            AspectRatio.RATIO_16_9 -> Modifier
-                .fillMaxWidth()
-                .aspectRatio(9f / 16f)                                    // 16:9 竖屏 = 宽:高 = 9:16
-                .align(Alignment.Center)
-            AspectRatio.RATIO_FULL -> Modifier
-                .fillMaxSize()                                            // 全屏填满
         }
 
         // 预览区域Box（包含相机预览和滤镜叠加层）
@@ -525,6 +539,8 @@ private fun CameraContent(
                 canUndoLastShot = canUndoLastShot,
                 onUndoLastShot = { showUndoConfirm = true },
                 onOpenShotList = { viewModel.showShotList(true) },
+                onSelectGroup = viewModel::selectGroup,
+                onOpenRoundPicker = { viewModel.showRoundPicker(true) },
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
@@ -540,6 +556,7 @@ private fun CameraContent(
         ShotListSheet(
             visible = isShotListVisible,
             batch = currentBatch,
+            thumbUris = shotListThumbs,
             onJumpTo = { index ->
                 // 已拍过的项=重拍：删除原照片不可恢复，先确认；未拍过的直接跳过去
                 if (currentBatch?.isNameShot(index) == true) {
@@ -548,8 +565,26 @@ private fun CameraContent(
                     viewModel.selectNameFromList(index)
                 }
             },
+            onPreview = { uri, title -> previewUri = uri to title },
             onDismiss = { viewModel.showShotList(false) }
         )
+
+        // 轮次选择：轮次切换是拍摄过程中的动作，入口就在批次条那一行
+        if (isRoundPickerVisible) {
+            currentBatch?.let { batch ->
+                RoundPickerDialog(
+                    target = batch,
+                    onSelect = { round -> viewModel.selectRound(round) },
+                    onResetToFirst = viewModel::resetRoundToFirst,
+                    onDismiss = { viewModel.showRoundPicker(false) }
+                )
+            }
+        }
+
+        // 点清单里的缩略图 -> 全屏核对这张是否拍错
+        previewUri?.let { (uri, title) ->
+            PhotoPreviewDialog(uri = uri, title = title, onDismiss = { previewUri = null })
+        }
 
         // 4.1 批次切换底部弹窗
         BatchSelectorSheet(
@@ -558,19 +593,7 @@ private fun CameraContent(
             currentBatchId = currentBatch?.id,
             onSelect = viewModel::selectBatch,
             onClear = viewModel::clearBatch,
-            onCreate = { name, dirName, prefix, startIndex, indexWidth, dateSubDir, mode, names, noteText ->
-                viewModel.createBatch(
-                    name = name,
-                    dirName = dirName,
-                    namePrefix = prefix,
-                    startIndex = startIndex,
-                    indexWidth = indexWidth,
-                    dateSubDir = dateSubDir,
-                    namingMode = mode,
-                    nameList = names,
-                    note = noteText
-                )
-            },
+            onCreate = { form -> viewModel.createBatch(form) },
             onDismiss = viewModel::hideBatchSheet
         )
 

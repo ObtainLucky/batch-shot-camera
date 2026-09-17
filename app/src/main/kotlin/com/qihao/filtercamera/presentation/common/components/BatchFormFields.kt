@@ -13,6 +13,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -72,6 +74,15 @@ fun BatchFormFields(
     onNamingModeChange: (NamingMode) -> Unit,
     nameListText: String,
     onNameListTextChange: (String) -> Unit,
+    /** 分组名（逗号分隔），如「上架_4U, 上架_2U」；空表示不使用分组 */
+    groupNamesText: String = "",
+    onGroupNamesTextChange: (String) -> Unit = {},
+    /** 一组拍完后是否自动切到下一组 */
+    autoAdvanceGroup: Boolean = true,
+    onAutoAdvanceGroupChange: (Boolean) -> Unit = {},
+    /** 文件名里是否带上分组名（上架_2U_xxx.jpg） */
+    includeGroupInFileName: Boolean = false,
+    onIncludeGroupInFileNameChange: (Boolean) -> Unit = {},
     note: String = "",
     onNoteChange: (String) -> Unit = {},
     /** 可复制的来源批次（从已有批次复制名字列表） */
@@ -260,6 +271,17 @@ fun BatchFormFields(
                     }
                 )
             }
+
+            Spacer(modifier = Modifier.height(12.dp))
+            GroupNamesField(
+                groupNamesText = groupNamesText,
+                onGroupNamesTextChange = onGroupNamesTextChange,
+                autoAdvanceGroup = autoAdvanceGroup,
+                onAutoAdvanceGroupChange = onAutoAdvanceGroupChange,
+                prefix = prefix,
+                includeGroupInFileName = includeGroupInFileName,
+                onIncludeGroupInFileNameChange = onIncludeGroupInFileNameChange
+            )
         }
 
         Spacer(modifier = Modifier.height(12.dp))
@@ -435,5 +457,135 @@ fun BatchInfoRow(
             style = MaterialTheme.typography.bodySmall,
             fontFamily = FontFamily.Monospace
         )
+    }
+}
+
+/**
+ * 分组名编辑区
+ *
+ * 现场流程：一天的工单里 上架/下架 各自还可能按 U 数分成几组（2U、4U），
+ * 每组都要把同一份拍摄清单走一遍。目录形如：
+ *   Pictures/工作/2026-09-17/上架_4U/
+ *
+ * 组名由用户自己填（逗号分隔），2U / 4U 是常用项所以给成一键按钮，
+ * 其余 U 数直接手输 —— 各仓库对 U 数的叫法并不统一。
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun GroupNamesField(
+    groupNamesText: String,
+    onGroupNamesTextChange: (String) -> Unit,
+    autoAdvanceGroup: Boolean,
+    onAutoAdvanceGroupChange: (Boolean) -> Unit,
+    prefix: String,
+    includeGroupInFileName: Boolean,
+    onIncludeGroupInFileNameChange: (Boolean) -> Unit
+) {
+    val parsed = remember(groupNamesText) { BatchConfig.parseNameList(groupNamesText) }
+
+    OutlinedTextField(
+        value = groupNamesText,
+        onValueChange = onGroupNamesTextChange,
+        label = { Text("分组（可选，逗号分隔）") },
+        placeholder = { Text("上架_4U, 上架_2U") },
+        singleLine = true,
+        supportingText = {
+            if (parsed.isEmpty()) {
+                Text("留空 = 不分组的单组模式；填了就按组分开建目录")
+            } else {
+                Text(
+                    "共 ${parsed.size} 组：" + parsed.joinToString("、") +
+                        "；拍照时会按组存到各自的子目录"
+                )
+            }
+        },
+        modifier = Modifier.fillMaxWidth()
+    )
+
+    Spacer(modifier = Modifier.height(4.dp))
+
+    // 常用 U 数一键追加，省掉手输
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        BatchConfig.PRESET_GROUP_OPTIONS.forEach { option ->
+            OutlinedButton(
+                onClick = {
+                    val current = BatchConfig.parseNameList(groupNamesText)
+                    if (option !in current) {
+                        onGroupNamesTextChange(
+                            BatchConfig.formatNameList(current + option).trim()
+                        )
+                    }
+                }
+            ) {
+                Text("+ $option", fontSize = 12.sp)
+            }
+        }
+        OutlinedButton(
+            onClick = { onGroupNamesTextChange("") },
+            enabled = groupNamesText.isNotBlank()
+        ) {
+            Text("清空", fontSize = 12.sp)
+        }
+    }
+
+    if (parsed.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "一组拍完自动切到下一组",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    text = if (autoAdvanceGroup) {
+                        "拍完最后一组会提示当天拍完；也可随时点组标签手切"
+                    } else {
+                        "关掉后留在本组（继续拍进入本组第 2 轮），由你点组标签切组"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(checked = autoAdvanceGroup, onCheckedChange = onAutoAdvanceGroupChange)
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "文件名里带上分组",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    // 直接给出拼接结果，避免用户猜"开关到底会改哪儿"
+                    text = run {
+                        val sample = parsed.firstOrNull().orEmpty()
+                        val item = "小推车状态"
+                        val effectivePrefix = BatchConfig(
+                            name = "x",
+                            dirName = "x",
+                            namePrefix = prefix,
+                            namingMode = NamingMode.WORK,
+                            nameList = listOf(item),
+                            groupNames = listOf(sample.ifEmpty { "2U" }),
+                            includeGroupInFileName = includeGroupInFileName
+                        ).normalized().effectiveFilePrefix(sample.ifEmpty { "2U" })
+                        "示例：" + (if (effectivePrefix.isEmpty()) item else "${effectivePrefix}_$item") + ".jpg"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(
+                checked = includeGroupInFileName,
+                onCheckedChange = onIncludeGroupInFileNameChange
+            )
+        }
     }
 }

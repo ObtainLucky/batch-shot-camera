@@ -87,6 +87,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.qihao.filtercamera.domain.repository.MediaFile
 import com.qihao.filtercamera.domain.repository.MediaType
+import com.qihao.filtercamera.presentation.gallery.components.VideoPlayerDialog
 
 /**
  * 相册页面入口
@@ -806,6 +807,16 @@ private fun MediaDetailScreen(
 ) {
     val context = LocalContext.current
     var showDeleteDialog by remember { mutableStateOf(false) }
+    var showVideoPlayer by remember { mutableStateOf(false) }
+
+    // 视频播放器（点播放图标后打开）
+    if (showVideoPlayer && media.isVideo) {
+        VideoPlayerDialog(
+            uri = media.uri,
+            title = media.name,
+            onDismiss = { showVideoPlayer = false }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -880,13 +891,14 @@ private fun MediaDetailScreen(
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // 视频播放图标
+                // 视频播放图标：点它才真正开始播放
                 if (media.isVideo) {
                     Box(
                         modifier = Modifier
                             .size(64.dp)
                             .clip(CircleShape)
-                            .background(Color.Black.copy(alpha = 0.5f)),
+                            .background(Color.Black.copy(alpha = 0.5f))
+                            .clickable { showVideoPlayer = true },
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(

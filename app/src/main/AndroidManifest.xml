@@ -61,11 +61,17 @@
         tools:targetApi="36">
 
         <!-- 主Activity - 使用Jetpack Compose -->
+        <!--
+            不要加 android:screenOrientation="portrait"：
+            CameraX 的拍摄旋转角（ImageProxy.imageInfo.rotationDegrees）来自**屏幕方向**。
+            锁死竖屏后屏幕方向恒为 0，横着拿手机拍出来的照片和水印都是躺倒的，
+            而且整个界面也无法横屏。configChanges 已包含 orientation|screenSize，
+            旋转时 Activity 不会重建，Compose 直接重组。
+        -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:exported="true"
-            android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

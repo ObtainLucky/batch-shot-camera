@@ -13,6 +13,8 @@ package com.qihao.filtercamera.presentation.settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,8 +35,13 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -66,6 +73,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.qihao.filtercamera.domain.model.BatchConfig
 import com.qihao.filtercamera.domain.model.NamingMode
+import com.qihao.filtercamera.presentation.common.components.BatchFormData
 import com.qihao.filtercamera.presentation.common.components.BatchFormFields
 import com.qihao.filtercamera.presentation.common.components.BatchInfoRow
 
@@ -135,20 +143,7 @@ fun BatchManageScreen(
                     existingBatches = batches,
                     submitLabel = "保存",
                     onCancel = viewModel::dismissForm,
-                    onSubmit = { name, dirName, prefix, startIndex, indexWidth, dateSubDir, mode, names, noteText ->
-                        viewModel.updateBatch(
-                            batch = target,
-                            name = name,
-                            dirName = dirName,
-                            namePrefix = prefix,
-                            startIndex = startIndex,
-                            indexWidth = indexWidth,
-                            dateSubDir = dateSubDir,
-                            namingMode = mode,
-                            nameList = names,
-                            note = noteText
-                        )
-                    },
+                    onSubmit = { form -> viewModel.updateBatch(target, form) },
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(paddingValues)
@@ -162,19 +157,7 @@ fun BatchManageScreen(
                     existingBatches = batches,
                     submitLabel = "创建",
                     onCancel = viewModel::dismissForm,
-                    onSubmit = { name, dirName, prefix, startIndex, indexWidth, dateSubDir, mode, names, noteText ->
-                        viewModel.createBatch(
-                            name = name,
-                            dirName = dirName,
-                            namePrefix = prefix,
-                            startIndex = startIndex,
-                            indexWidth = indexWidth,
-                            dateSubDir = dateSubDir,
-                            namingMode = mode,
-                            nameList = names,
-                            note = noteText
-                        )
-                    },
+                    onSubmit = { form -> viewModel.createBatch(form) },
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(paddingValues)
@@ -250,6 +233,7 @@ fun BatchManageScreen(
                             onEdit = { viewModel.startEdit(batch) },
                             onResetCounter = { viewModel.resetCounter(batch) },
                             onNewRound = { viewModel.requestNewRound(batch) },
+                            onSyncFromDisk = { viewModel.requestSyncFromDisk(batch) },
                             onDelete = { viewModel.requestDelete(batch) }
                         )
                     }
@@ -281,6 +265,29 @@ fun BatchManageScreen(
         )
     }
 
+    // 按磁盘同步确认
+    uiState.syncTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = viewModel::cancelSyncFromDisk,
+            title = { Text("按磁盘上的文件重新识别？") },
+            text = {
+                Text(
+                    "将扫描 Pictures/${target.safeDirName}/" +
+                        (if (target.dateSubDir) "${BatchConfig.dateStampFor()}/" else "") +
+                        " 下的照片，据此重建「${target.name}」的轮次与已拍进度。\n\n" +
+                        "用在你在文件管理器里删掉或替换过某个轮次目录、而 App 还停在" +
+                        "旧轮次的时候。只读取磁盘，不会删除或移动任何照片。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = viewModel::confirmSyncFromDisk) { Text("重新识别") }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::cancelSyncFromDisk) { Text("取消") }
+            }
+        )
+    }
+
     // 删除确认
     uiState.deleteTarget?.let { target ->
         AlertDialog(
@@ -288,9 +295,10 @@ fun BatchManageScreen(
             title = { Text("删除批次「${target.name}」？") },
             text = {
                 Text(
-                    if (target.counter > 0) {
-                        "该批次已拍 ${target.counter} 张。删除只移除批次定义，" +
-                            "已存进相册的照片不受影响。"
+                    // 用 shotCount 而不是 counter：工作模式的 counter 只是镜像值
+                    if (target.shotCount > 0) {
+                        "该批次${target.progressSummary}。" +
+                            "删除只移除批次定义，已存进相册的照片不受影响。"
                     } else {
                         "删除只移除批次定义，不会影响相册里的任何照片。"
                     }
@@ -313,6 +321,7 @@ fun BatchManageScreen(
 /**
  * 单个批次卡片
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BatchCard(
     batch: BatchConfig,
@@ -321,6 +330,7 @@ private fun BatchCard(
     onEdit: () -> Unit,
     onResetCounter: () -> Unit,
     onNewRound: () -> Unit,
+    onSyncFromDisk: () -> Unit,
     onDelete: () -> Unit
 ) {
     Card(
@@ -365,20 +375,38 @@ private fun BatchCard(
 
             BatchInfoRow(label = "下一张", value = batch.nextFileName())
             BatchInfoRow(
-                label = "已拍",
-                value = batch.workProgressLabel ?: "${batch.counter} 张"
+                label = "进度",
+                value = batch.progressSummary
             )
+            if (batch.usesGroups) {
+                // 各组进度一眼看全：现场最关心的就是"哪组还没拍"
+                val total = batch.effectiveNameList.size
+                BatchInfoRow(
+                    label = "分组",
+                    value = batch.groupNames.joinToString("、") { name ->
+                        val shot = batch.groupShotCountOf(name)
+                        val mark = if (total > 0 && shot >= total) "✓" else ""
+                        "$name $shot/$total$mark"
+                    }
+                )
+            }
             if (batch.usesRoundSubDir) {
                 BatchInfoRow(
                     label = "轮次",
-                    value = "第 ${batch.round} 轮（拍完自动进入第 ${batch.round + 1} 轮）"
+                    value = if (batch.usesGroups) {
+                        "第 ${batch.round} 轮（当前组重拍时才 +1）"
+                    } else {
+                        "第 ${batch.round} 轮（拍完自动进入第 ${batch.round + 1} 轮）"
+                    }
                 )
             }
 
             BatchInfoRow(
                 label = "保存到",
                 value = "Pictures/" + batch.relativeSubPath(
-                    dateStamp = if (batch.dateSubDir) "yyyy-MM-dd" else null
+                    // 这里以前传的是字面量 "yyyy-MM-dd"，界面上直接显示了占位符，
+                    // 与真实存盘路径对不上。日期格式与存盘走同一个函数。
+                    dateStamp = if (batch.dateSubDir) BatchConfig.dateStampFor() else null
                 ) + "/"
             )
             BatchInfoRow(
@@ -413,10 +441,13 @@ private fun BatchCard(
             Spacer(modifier = Modifier.height(8.dp))
 
             // 操作行
-            Row(
+            //
+            // 用 FlowRow 而不是 Row：工作模式下这里有「设为当前 / 新一轮 / 回到第1轮」
+            // 三个文字按钮加三个图标按钮，固定一行在窄屏或大字体下必然被挤爆。
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterVertically)
             ) {
                 if (!isCurrent) {
                     OutlinedButton(onClick = onSelect) {
@@ -435,13 +466,26 @@ private fun BatchCard(
                     OutlinedButton(onClick = onNewRound) {
                         Text("新一轮")
                     }
+                    // 轮次切换的入口放在**拍摄界面**的批次条上：那是现场真正需要它的地方，
+                    // 要退出相机才能切轮次的话，这个功能在实际节奏里用不上。
                 }
 
                 IconButton(onClick = onEdit) {
                     Icon(Icons.Default.Edit, contentDescription = "编辑")
                 }
                 IconButton(onClick = onResetCounter) {
-                    Icon(Icons.Default.Restore, contentDescription = "重置序号")
+                    // 工作模式重置的是"本轮已拍清单 + 名字指针"，说成"序号"会让人找不到北
+                    Icon(
+                        Icons.Default.Restore,
+                        contentDescription = if (batch.isWorkMode) "重拍本轮" else "重置序号"
+                    )
+                }
+                // 在文件管理器里删掉/替换过轮次目录后，App 的状态会与磁盘脱节，
+                // 这个入口按磁盘实际文件重建轮次与进度
+                if (batch.isWorkMode) {
+                    IconButton(onClick = onSyncFromDisk) {
+                        Icon(Icons.Default.Refresh, contentDescription = "按磁盘同步")
+                    }
                 }
                 IconButton(onClick = onDelete) {
                     Icon(
@@ -487,7 +531,7 @@ private fun BatchEditForm(
     existingBatches: List<BatchConfig>,
     submitLabel: String,
     onCancel: () -> Unit,
-    onSubmit: (String, String, String, Int, Int, Boolean, NamingMode, List<String>, String) -> Unit,
+    onSubmit: (BatchFormData) -> Unit,
     modifier: Modifier = Modifier
 ) {
     // 新建时预填建议值，编辑时用批次自身字段
@@ -508,6 +552,15 @@ private fun BatchEditForm(
     }
     var nameListText by remember(initial) {
         mutableStateOf(BatchConfig.formatNameList(initial?.nameList ?: emptyList()))
+    }
+    var groupNamesText by remember(initial) {
+        mutableStateOf(BatchConfig.formatNameList(initial?.groupNames ?: emptyList()))
+    }
+    var autoAdvanceGroup by remember(initial) {
+        mutableStateOf(initial?.autoAdvanceGroup ?: true)
+    }
+    var includeGroupInFileName by remember(initial) {
+        mutableStateOf(initial?.includeGroupInFileName ?: false)
     }
     var note by remember(initial) { mutableStateOf(initial?.note ?: "") }
 
@@ -549,6 +602,12 @@ private fun BatchEditForm(
                 onNamingModeChange = { namingMode = it },
                 nameListText = nameListText,
                 onNameListTextChange = { nameListText = it },
+                groupNamesText = groupNamesText,
+                onGroupNamesTextChange = { groupNamesText = it },
+                autoAdvanceGroup = autoAdvanceGroup,
+                onAutoAdvanceGroupChange = { autoAdvanceGroup = it },
+                includeGroupInFileName = includeGroupInFileName,
+                onIncludeGroupInFileNameChange = { includeGroupInFileName = it },
                 note = note,
                 onNoteChange = { note = it },
                 copyableBatches = existingBatches,
@@ -567,28 +626,29 @@ private fun BatchEditForm(
             if (initial != null) {
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // 工作模式下如果已拍数量已超过名字个数，保存后仍会回落序号命名，
-                // 提前说清楚，避免又出现"填了名字不生效"的困惑
-                val willFallBack = namingMode == NamingMode.WORK &&
-                    parsedNames.isNotEmpty() &&
-                    namingMode == initial.namingMode &&
-                    initial.counter >= parsedNames.size
+                // 提醒文案必须和实际行为一致。早先这里写的是"已拍数量超过名字个数
+                // 就会回落序号命名"，但那种情况实际会自动进入下一轮；
+                // 真正会回落序号命名的只有"工作模式但名字列表为空"。
+                val willFallBackToSequence = namingMode == NamingMode.WORK &&
+                    parsedNames.isEmpty()
 
                 Text(
                     text = when {
-                        willFallBack ->
-                            "注意：该批次已拍到第 ${initial.counter} 个，而名字列表只有 " +
-                                "${parsedNames.size} 个，保存后仍会回落序号命名。" +
-                                "请用列表里的「重置序号」从第一个名字重新开始。"
+                        willFallBackToSequence ->
+                            "注意：工作模式下没有填名字列表，保存后会按序号命名（前缀 + 序号）。"
                         namingMode != initial.namingMode ->
                             "已切换命名模式：保存后计数会重置，" +
                                 "下一张为 ${namePreview(prefix, namingMode, parsedNames)}"
+                        initial.isWorkMode && initial.isRoundComplete ->
+                            "该批次第 ${initial.round} 轮已拍完，继续拍会自动进入" +
+                                "第 ${initial.round + 1} 轮。如需重拍本轮，" +
+                                "请用列表里的「重拍本轮」。"
                         else ->
-                            "编辑不会改变已拍张数（当前 ${initial.counter} 张）。" +
-                                "如需从头编号，请用列表里的「重置序号」。"
+                            "编辑不会改变已拍进度（${initial.progressSummary}）。" +
+                                "如需从头开始，请用列表里的「重拍本轮」或「回到第1轮」。"
                     },
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (willFallBack) {
+                    color = if (willFallBackToSequence) {
                         MaterialTheme.colorScheme.error
                     } else {
                         MaterialTheme.colorScheme.onSurfaceVariant
@@ -613,17 +673,23 @@ private fun BatchEditForm(
             Button(
                 onClick = {
                     onSubmit(
-                        name.trim(),
-                        dirName.trim(),
-                        prefix.trim(),
-                        startIndex.toIntOrNull() ?: BatchConfig.DEFAULT_START_INDEX,
-                        indexWidth.toIntOrNull()
-                            ?.coerceIn(BatchConfig.MIN_INDEX_WIDTH, BatchConfig.MAX_INDEX_WIDTH)
-                            ?: BatchConfig.DEFAULT_INDEX_WIDTH,
-                        dateSubDir,
-                        namingMode,
-                        BatchConfig.parseNameList(nameListText),
-                        note
+                        BatchFormData(
+                            name = name.trim(),
+                            dirName = dirName.trim(),
+                            prefix = prefix.trim(),
+                            startIndex = startIndex.toIntOrNull()
+                                ?: BatchConfig.DEFAULT_START_INDEX,
+                            indexWidth = indexWidth.toIntOrNull()
+                                ?.coerceIn(BatchConfig.MIN_INDEX_WIDTH, BatchConfig.MAX_INDEX_WIDTH)
+                                ?: BatchConfig.DEFAULT_INDEX_WIDTH,
+                            dateSubDir = dateSubDir,
+                            namingMode = namingMode,
+                            nameList = BatchConfig.parseNameList(nameListText),
+                            note = note,
+                            groupNames = BatchConfig.parseNameList(groupNamesText),
+                            autoAdvanceGroup = autoAdvanceGroup,
+                            includeGroupInFileName = includeGroupInFileName
+                        )
                     )
                 },
                 enabled = canSubmit,
@@ -634,3 +700,4 @@ private fun BatchEditForm(
         }
     }
 }
+

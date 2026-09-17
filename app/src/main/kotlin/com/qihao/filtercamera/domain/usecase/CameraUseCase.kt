@@ -55,11 +55,14 @@ class CameraUseCase @Inject constructor(
 
     /**
      * 绑定相机到生命周期和预览视图
-     * @param owner 生命周期持有者
-     * @param previewView 预览视图
+     *
+     * @param videoMode 本次绑定是否为录像模式（见 ICameraRepository.bindCamera）
      */
-    suspend fun bindCamera(owner: LifecycleOwner, previewView: PreviewView) =
-        camera.bindCamera(owner, previewView)
+    suspend fun bindCamera(
+        owner: LifecycleOwner,
+        previewView: PreviewView,
+        videoMode: Boolean
+    ) = camera.bindCamera(owner, previewView, videoMode)
 
     // ==================== 拍照操作 ====================
 
@@ -268,6 +271,19 @@ class CameraUseCase @Inject constructor(
     // ==================== 录像操作 ====================
 
     /**
+     * 切换用例绑定模式（拍照 / 录像）
+     *
+     * 相机页切换模式时调用。CameraX 的拍照与录像用例不能无脑同绑，
+     * 必须在模式切换时重绑，详见 ICameraRepository.setVideoMode。
+     */
+    suspend fun setVideoMode(videoMode: Boolean): Result<Unit> = camera.setVideoMode(videoMode)
+
+    /**
+     * 声明上层是否在消费分析帧（人像/文档模式的叠加层需要）
+     */
+    fun setAnalysisConsumerActive(active: Boolean) = camera.setAnalysisConsumerActive(active)
+
+    /**
      * 开始录像
      * @return 操作结果
      */
@@ -275,12 +291,18 @@ class CameraUseCase @Inject constructor(
 
     /**
      * 停止录像并保存到相册
+     *
+     * 选中批次时，视频与照片落在**同一个批次目录**里 —— 素材散到别的目录会让
+     * 事后按批次整理变得很痛苦；但视频不参与照片的序号命名，用带时间戳的
+     * VID_ 文件名，也不消耗序号（否则一段视频会顶掉一个拍摄项）。
+     *
      * @return 视频Uri的Result
      */
     suspend fun stopRecording(): Result<Uri> = runCatching {
         val videoPath = camera.stopRecording().getOrThrow()           // 停止录像获取路径
         val fileName = media.generateVideoFileName()                  // 生成文件名
-        media.saveVideo(videoPath, fileName).getOrThrow()             // 保存到MediaStore
+        media.saveVideo(videoPath, fileName, currentBatchOrNull())    // 保存到MediaStore
+            .getOrThrow()
     }
 
     /**

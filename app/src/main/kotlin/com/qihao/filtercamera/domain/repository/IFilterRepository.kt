@@ -83,6 +83,24 @@ interface IFilterRepository {
     fun applyFilterToBitmapSync(filterType: FilterType, sourceBitmap: Bitmap): Bitmap?
 
     /**
+     * 同步应用滤镜到图像（指定强度）
+     *
+     * 编辑器必须走这个重载：不带强度的版本读的是仓库里的单例强度
+     * （相机页在用），编辑器调它等于"用相机的强度渲染编辑器的图"，
+     * 界面上的强度滑块怎么拖都没反应。
+     *
+     * @param filterType 滤镜类型
+     * @param sourceBitmap 源图像
+     * @param intensity 滤镜强度（0.0~1.0）
+     * @return 应用滤镜后的图像
+     */
+    fun applyFilterToBitmapSync(
+        filterType: FilterType,
+        sourceBitmap: Bitmap,
+        intensity: Float
+    ): Bitmap?
+
+    /**
      * 设置页的「信息水印」开关是否打开
      *
      * 信息水印是独立于滤镜选择的叠加效果：开关打开时，即使当前滤镜是"原图"

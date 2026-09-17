@@ -291,11 +291,17 @@ class BatchRepositoryImpl @Inject constructor(
     }
 
     /**
-     * 重置已拍张数
+     * 重置进度（回到本轮的起点）
+     *
+     * 必须走 [BatchConfig.withProgressReset]：工作模式的进度存在
+     * shotIndexes / nextIndex 里，counter 只是镜像。此前这里只写 `counter = 0`，
+     * 于是工作模式下按"重置"完全没有效果 —— 已拍清单和指针都不动，
+     * 下一张还会因为本轮已拍完而跳到下一轮。
      */
     override suspend fun resetCounter(id: String): Result<Unit> = runCatching<Unit> {
         withContext(ioDispatcher) {
             var found = false
+            var nextName: String? = null
             dataStore.edit { preferences ->
                 val list = decodeBatches(preferences[KEY_BATCHES_JSON])
                 val index = list.indexOfFirst { it.id == id }
@@ -303,13 +309,40 @@ class BatchRepositoryImpl @Inject constructor(
                     return@edit
                 }
                 found = true
-                val updated = list.toMutableList().apply {
-                    this[index] = list[index].copy(counter = 0)
-                }
+                val reset = list[index].withProgressReset()
+                val updated = list.toMutableList().apply { this[index] = reset }
                 preferences[KEY_BATCHES_JSON] = encodeBatches(updated)
+                nextName = reset.nextFileName()
             }
             if (!found) throw IllegalStateException("批次不存在: $id")
-            Log.d(TAG, "resetCounter: 批次 $id 计数已重置")
+            Log.d(TAG, "resetCounter: 批次 $id 本轮进度已清空，下一张=$nextName")
+        }
+    }
+
+    /**
+     * 轮次归 1 并清空进度
+     *
+     * 轮次只增不减，跨天复用同一个批次时会一路延续下去（当天目录里直接是
+     * 「第5轮」），此前没有任何入口能调回来，这里补上。
+     */
+    override suspend fun resetRound(id: String): Result<Unit> = runCatching<Unit> {
+        withContext(ioDispatcher) {
+            var found = false
+            var nextName: String? = null
+            dataStore.edit { preferences ->
+                val list = decodeBatches(preferences[KEY_BATCHES_JSON])
+                val index = list.indexOfFirst { it.id == id }
+                if (index < 0) {
+                    return@edit
+                }
+                found = true
+                val reset = list[index].withRoundReset()
+                val updated = list.toMutableList().apply { this[index] = reset }
+                preferences[KEY_BATCHES_JSON] = encodeBatches(updated)
+                nextName = reset.nextFileName()
+            }
+            if (!found) throw IllegalStateException("批次不存在: $id")
+            Log.d(TAG, "resetRound: 批次 $id 已回到第 1 轮，下一张=$nextName")
         }
     }
 
@@ -360,6 +393,54 @@ class BatchRepositoryImpl @Inject constructor(
                 Log.d(TAG, "setNamePointer: 批次 $id 指针 -> ${updated[pos].counter}")
             }
             if (!found) throw IllegalStateException("批次不存在: $id")
+        }
+    }
+
+    /**
+     * 跳到指定轮次
+     */
+    override suspend fun setRound(id: String, round: Int): Result<Unit> = runCatching<Unit> {
+        withContext(ioDispatcher) {
+            var found = false
+            var nextName: String? = null
+            dataStore.edit { preferences ->
+                val list = decodeBatches(preferences[KEY_BATCHES_JSON])
+                val pos = list.indexOfFirst { it.id == id }
+                if (pos < 0) {
+                    return@edit
+                }
+                found = true
+                val switched = list[pos].withRound(round)
+                nextName = switched.nextFileName()
+                val updated = list.toMutableList().apply { this[pos] = switched }
+                preferences[KEY_BATCHES_JSON] = encodeBatches(updated)
+            }
+            if (!found) throw IllegalStateException("批次不存在: $id")
+            Log.d(TAG, "setRound: 批次 $id 跳到第 $round 轮，下一张=$nextName")
+        }
+    }
+
+    /**
+     * 切换到指定分组
+     */
+    override suspend fun setActiveGroup(id: String, index: Int): Result<Unit> = runCatching<Unit> {
+        withContext(ioDispatcher) {
+            var found = false
+            var groupName: String? = null
+            dataStore.edit { preferences ->
+                val list = decodeBatches(preferences[KEY_BATCHES_JSON])
+                val pos = list.indexOfFirst { it.id == id }
+                if (pos < 0) {
+                    return@edit
+                }
+                found = true
+                val switched = list[pos].withActiveGroup(index)
+                groupName = switched.activeGroupName
+                val updated = list.toMutableList().apply { this[pos] = switched }
+                preferences[KEY_BATCHES_JSON] = encodeBatches(updated)
+            }
+            if (!found) throw IllegalStateException("批次不存在: $id")
+            Log.d(TAG, "setActiveGroup: 批次 $id 切到组「$groupName」")
         }
     }
 

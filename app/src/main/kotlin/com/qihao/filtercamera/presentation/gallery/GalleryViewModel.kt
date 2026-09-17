@@ -278,14 +278,24 @@ class GalleryViewModel @Inject constructor(
 
     /**
      * 全选/取消全选
+     *
+     * 只能选**当前看得见**的那些：搜索或"只看收藏"过滤生效时，用完整的
+     * mediaFiles 会让用户对着 3 条搜索结果点"全选"，然后删掉几百张照片。
      */
     fun selectAll() {
-        val allUris = _uiState.value.mediaFiles.map { it.uri }.toSet()
-        val isAllSelected = _uiState.value.selectedUris.size == allUris.size
+        val visibleUris = _uiState.value.displayMediaFiles.map { it.uri }.toSet()
+        val isAllSelected = visibleUris.isNotEmpty() &&
+            visibleUris.all { it in _uiState.value.selectedUris }
 
-        Log.d(TAG, "selectAll: isAllSelected=$isAllSelected")
+        Log.d(TAG, "selectAll: isAllSelected=$isAllSelected, 可见=${visibleUris.size}")
         _uiState.update {
-            it.copy(selectedUris = if (isAllSelected) emptySet() else allUris)
+            it.copy(
+                selectedUris = if (isAllSelected) {
+                    it.selectedUris - visibleUris                                 // 只取消可见部分
+                } else {
+                    it.selectedUris + visibleUris                                 // 保留已选中的其它项
+                }
+            )
         }
     }
 

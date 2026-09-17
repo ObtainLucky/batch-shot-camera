@@ -44,10 +44,20 @@ interface ICameraRepository {
 
     /**
      * 绑定相机到生命周期和预览视图
+     *
      * @param owner 生命周期持有者
      * @param previewView 预览视图
+     * @param videoMode 本次绑定是否为录像模式
+     *
+     * 模式必须由调用方在这次绑定里明确给出，不能让仓库沿用上一次的取值 ——
+     * 仓库是单例，用户"进录像模式 -> 退出 -> 再进相机页"时页面回到拍照模式，
+     * 仓库却还记得录像，结果绑的是录像用例，拍照按钮直接失效。
      */
-    suspend fun bindCamera(owner: LifecycleOwner, previewView: PreviewView)
+    suspend fun bindCamera(
+        owner: LifecycleOwner,
+        previewView: PreviewView,
+        videoMode: Boolean
+    )
 
     /**
      * 拍照
@@ -66,6 +76,30 @@ interface ICameraRepository {
      * @return 视频保存路径
      */
     suspend fun stopRecording(): Result<String>
+
+    /**
+     * 切换用例绑定模式（拍照 / 录像）
+     *
+     * CameraX 的用例组合是**互斥资源**：Recorder 只有在参与 bindToLifecycle
+     * 之后才真正接到相机上，而 Preview+ImageCapture+VideoCapture+ImageAnalysis
+     * 四个用例同绑只在 FULL 级设备上被支持。所以拍照/录像必须按模式分别绑定，
+     * 模式切换时重绑一次。
+     *
+     * @param videoMode true=录像模式（绑 Preview+VideoCapture），false=拍照模式
+     * @return 操作结果
+     */
+    suspend fun setVideoMode(videoMode: Boolean): Result<Unit>
+
+    /**
+     * 声明上层是否正在消费分析帧
+     *
+     * 人像模式的人脸框、文档模式的边缘框都是从分析帧位图上检测出来的。
+     * 相机仓库为了省电会丢弃"没人要"的分析帧，所以上层进入这类模式时必须
+     * 明确声明一声，否则叠加层会在某些设置组合下冻住不动。
+     *
+     * @param active true=有人在消费分析帧
+     */
+    fun setAnalysisConsumerActive(active: Boolean)
 
     /**
      * 切换摄像头

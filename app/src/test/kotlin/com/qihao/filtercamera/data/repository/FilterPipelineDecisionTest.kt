@@ -94,6 +94,45 @@ class FilterPipelineDecisionTest {
     }
 
     /**
+     * 上层有人消费分析帧时必须转换
+     *
+     * 人像的人脸框、文档的边缘框都是 ViewModel 从滤镜帧流里拿位图去检测的。
+     * 漏掉这一条，用户把美颜关到 0 又没选滤镜时，这些叠加层就冻在最后一帧上了。
+     */
+    @Test
+    fun externalConsumer_forcesAnalysisConversion() {
+        assertTrue(
+            "人像/文档模式在消费分析帧时必须转换",
+            CameraRepositoryImpl.needsAnalysisBitmap(
+                filterType = FilterType.NONE,
+                infoWatermarkEnabled = false,
+                beautyIntensity = 0f,
+                portraitBlurActive = false,
+                hasRawFrame = true,
+                externalConsumerActive = true
+            )
+        )
+    }
+
+    /**
+     * 没人消费时仍然要省掉转换（保留原本的性能优化）
+     */
+    @Test
+    fun noExternalConsumer_stillSkips() {
+        assertFalse(
+            "上层没有消费者时不该转换",
+            CameraRepositoryImpl.needsAnalysisBitmap(
+                filterType = FilterType.NONE,
+                infoWatermarkEnabled = false,
+                beautyIntensity = 0f,
+                portraitBlurActive = false,
+                hasRawFrame = true,
+                externalConsumerActive = false
+            )
+        )
+    }
+
+    /**
      * 还没抓到原始预览帧时必须转一帧，否则滤镜缩略图没有素材
      */
     @Test

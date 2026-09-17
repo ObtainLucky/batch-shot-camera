@@ -124,6 +124,8 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 # Coil图片加载
 coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coil" }
+# Coil视频帧解码：缺了它 AsyncImage 拿到 video/* 解码失败，相册里的视频缩略图/详情全是空白
+coil-video = { group = "io.coil-kt", name = "coil-video", version.ref = "coil" }
 
 # RenderScript Toolkit (RenderScript替代方案 - 高斯模糊 via JitPack)
 renderscript-toolkit = { group = "com.github.android", name = "renderscript-intrinsics-replacement-toolkit", version.ref = "renderscriptToolkit" }

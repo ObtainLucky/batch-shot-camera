@@ -18,8 +18,8 @@ android {
         applicationId = "com.qihao.filtercamera"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 1
-        versionName = "2.0.0"
+        versionCode = 2
+        versionName = "2.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -159,6 +159,8 @@ dependencies {
 
     // Coil图片加载（相册）
     implementation(libs.coil.compose)
+    // Coil视频帧解码（相册里的视频缩略图与详情预览）
+    implementation(libs.coil.video)
 
     // RenderScript Toolkit (高斯模糊 - 替代已弃用的RenderScript)
     implementation(libs.renderscript.toolkit)

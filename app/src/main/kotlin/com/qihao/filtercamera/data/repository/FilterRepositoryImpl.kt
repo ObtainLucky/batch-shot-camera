@@ -394,6 +394,25 @@ class FilterRepositoryImpl @Inject constructor(
     }
 
     /**
+     * 同步应用滤镜到图像（指定强度）
+     *
+     * 编辑器专用。加锁是因为 applyFilterWithIntensity 会临时改写共享的
+     * _currentIntensity，不加锁时并发调用会互相看到对方的强度。
+     */
+    @Synchronized
+    override fun applyFilterToBitmapSync(
+        filterType: FilterType,
+        sourceBitmap: Bitmap,
+        intensity: Float
+    ): Bitmap? {
+        Log.d(
+            TAG,
+            "applyFilterToBitmapSync: 同步应用滤镜 filterType=$filterType, intensity=$intensity"
+        )
+        return applyFilterWithIntensity(filterType, sourceBitmap, intensity)
+    }
+
+    /**
      * 信息水印开关是否打开
      */
     override fun isInfoWatermarkEnabled(): Boolean = watermarkInfoProvider.isInfoWatermarkEnabled()

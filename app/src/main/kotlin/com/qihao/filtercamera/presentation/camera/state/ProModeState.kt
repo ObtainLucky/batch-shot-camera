@@ -291,6 +291,33 @@ class ProModeStateHolder(
         }
     }
 
+    // ==================== 重新下发 ====================
+
+    /**
+     * 把当前专业模式参数重新下发给相机
+     *
+     * 相机每次绑定/重绑都会产生**新的** CameraControl，之前设置的 Camera2
+     * 请求选项（ISO / 快门 / 白平衡 / 对焦）全部丢失。所以要在这里重发一遍，
+     * 否则会出现"面板上明明显示手动 ISO，实际却按自动曝光拍"的错位；
+     * 反过来，相机页重建（面板已回到默认值）时也需要这一下发来清掉上一轮
+     * 残留的手动曝光，让界面与实际保持一致。
+     */
+    fun reapplyToCamera() {
+        val s = _state.value.settings
+        Log.d(TAG, "reapplyToCamera: ${getSettingsSummary()}")
+
+        scope.launch {
+            // 每个 setter 只改自己那几个字段并整份重发，所以顺序不影响最终结果
+            useCase.setIso(s.iso)
+            useCase.setShutterSpeed(s.shutterSpeed)
+            useCase.setWhiteBalance(s.whiteBalance)
+            useCase.setFocusMode(s.focusMode)
+            if (s.focusMode == FocusMode.MANUAL) {
+                useCase.setFocusDistance(s.focusDistance)
+            }
+        }
+    }
+
     /**
      * 获取当前设置的摘要（用于显示/调试）
      */

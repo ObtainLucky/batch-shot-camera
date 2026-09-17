@@ -114,6 +114,20 @@ interface IMediaRepository {
     suspend fun saveVideo(videoPath: String, fileName: String): Result<Uri>
 
     /**
+     * 保存视频到相册（批次模式）
+     *
+     * 选中批次时视频与照片归入同一个批次子目录，便于事后按批次整理。
+     * 注意顶级目录仍然是 Movies：Scoped Storage 只允许视频把 Movies/DCIM 写进
+     * RELATIVE_PATH，写 Pictures 会被系统直接拒绝。
+     *
+     * @param videoPath 视频临时文件路径
+     * @param fileName 文件名（不含扩展名）
+     * @param batch 当前批次，null 表示走默认目录
+     * @return 保存结果，包含文件Uri
+     */
+    suspend fun saveVideo(videoPath: String, fileName: String, batch: BatchConfig?): Result<Uri>
+
+    /**
      * 查询指定目录下的照片（用于导出批次清单）
      *
      * @param relativePathHint 目录名或目录名片段，如 "工作/设备上架"

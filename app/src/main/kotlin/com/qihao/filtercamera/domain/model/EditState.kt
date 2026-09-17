@@ -118,11 +118,64 @@ data class CropState(
 ) {
     /**
      * 检查是否有任何变换
+     *
+     * 裁剪比例也算一种变换：只选了 1:1 而没旋转/翻转时，图也必须真被裁成方的。
+     * 早期版本漏了这一项，于是"选比例"只点亮按钮、图片纹丝不动。
      */
     fun hasTransforms(): Boolean {
         return rotation != 0f || isFlippedHorizontal || isFlippedVertical ||
+               cropRatio != CropRatio.FREE ||
                !cropRect.isEmpty
     }
+}
+
+/**
+ * 计算"居中裁剪到指定宽高比"所需的区域
+ *
+ * 相机拍出来的画幅很少正好等于用户选的比例，所以只能裁掉多余的一边：
+ * 图比目标更宽就裁左右，更高就裁上下。
+ *
+ * 抽成纯函数是为了能脱离 Bitmap 做单元测试 —— 这个计算以前根本不存在，
+ * 用户选 1:1 时只点亮了按钮、图片没有任何变化。
+ *
+ * @param imageWidth 图片宽（像素）
+ * @param imageHeight 图片高（像素）
+ * @param targetRatio 目标宽高比（<= 0 表示不裁剪）
+ * @return [x, y, width, height]；无需裁剪时返回 null
+ */
+internal fun centerCropRect(
+    imageWidth: Int,
+    imageHeight: Int,
+    targetRatio: Float
+): IntArray? {
+    if (targetRatio <= 0f) return null
+    if (imageWidth <= 0 || imageHeight <= 0) return null
+
+    val currentRatio = imageWidth.toFloat() / imageHeight
+    val targetWidth: Int
+    val targetHeight: Int
+
+    when {
+        currentRatio > targetRatio -> {                                   // 太宽 -> 裁左右
+            targetHeight = imageHeight
+            targetWidth = (imageHeight * targetRatio).toInt()
+        }
+        currentRatio < targetRatio -> {                                   // 太高 -> 裁上下
+            targetWidth = imageWidth
+            targetHeight = (imageWidth / targetRatio).toInt()
+        }
+        else -> return null                                               // 已经一致
+    }
+
+    if (targetWidth <= 0 || targetHeight <= 0) return null
+    if (targetWidth == imageWidth && targetHeight == imageHeight) return null
+
+    return intArrayOf(
+        (imageWidth - targetWidth) / 2,
+        (imageHeight - targetHeight) / 2,
+        targetWidth,
+        targetHeight
+    )
 }
 
 /**

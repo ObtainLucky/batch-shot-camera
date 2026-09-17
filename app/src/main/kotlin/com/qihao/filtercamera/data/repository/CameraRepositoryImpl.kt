@@ -44,6 +44,7 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -57,9 +58,16 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.view.OrientationEventListener
+import android.view.Surface
 import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import com.qihao.filtercamera.domain.model.CameraLens
@@ -82,7 +90,9 @@ import com.qihao.filtercamera.domain.repository.ZoomRange
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -128,6 +138,14 @@ class CameraRepositoryImpl @Inject constructor(
         private const val ANALYSIS_HEIGHT = 720                           // 分析帧高度
         private const val FRAME_BUFFER_CAPACITY = 3                       // 帧缓冲区容量
         private const val FRAME_PROCESSING_INTERVAL_MS = 33L              // 帧处理间隔（约30fps）
+        private const val START_TIMEOUT_MS = 5_000L                       // 等待录像真正开始的超时
+
+        /** 方向变化后延迟重绑的防抖时间（等方向稳定下来再动相机） */
+        private const val ROTATION_REBIND_DEBOUNCE_MS = 400L
+
+        /** 相机忙时等待重绑的上限与轮询间隔 */
+        private const val ROTATION_REBIND_MAX_WAIT_MS = 2_000L
+        private const val ROTATION_REBIND_RETRY_MS = 200L
 
         /**
          * 无滤镜时是否仍需要走一趟滤镜链路
@@ -156,11 +174,16 @@ class CameraRepositoryImpl @Inject constructor(
          *
          * 所以这里先判断"有没有消费者"，没有就直接丢弃这一帧。
          *
+         * 注意 [externalConsumerActive]：人像模式的人脸框、文档模式的边缘框都是由
+         * ViewModel 从滤镜帧流里拿位图去检测的。如果只看"滤镜/美颜/虚化"这几个
+         * 仓库内部的条件，用户把美颜关到 0 又没选滤镜时，这些叠加层就会冻在最后一帧上。
+         *
          * @param filterType 当前滤镜
          * @param infoWatermarkEnabled 信息水印开关
          * @param beautyIntensity 美颜强度
          * @param portraitBlurActive 人像虚化是否开启
          * @param hasRawFrame 是否已经抓到过原始预览帧（滤镜缩略图需要它）
+         * @param externalConsumerActive 上层是否有人在消费分析帧（人像/文档叠加层）
          * @return true 表示需要转换
          */
         internal fun needsAnalysisBitmap(
@@ -168,15 +191,102 @@ class CameraRepositoryImpl @Inject constructor(
             infoWatermarkEnabled: Boolean,
             beautyIntensity: Float,
             portraitBlurActive: Boolean,
-            hasRawFrame: Boolean
+            hasRawFrame: Boolean,
+            externalConsumerActive: Boolean = false
         ): Boolean {
             if (needsFilterPipeline(filterType, infoWatermarkEnabled)) return true
             if (beautyIntensity > 0f) return true
             if (portraitBlurActive) return true
+            if (externalConsumerActive) return true
             // 还没抓到原始帧时先转一帧，否则滤镜缩略图会没素材
             if (!hasRawFrame) return true
             return false
         }
+
+        /**
+         * 按优先级排列的用例绑订候选组合
+         *
+         * 抽成纯函数是为了能直接写单元测试锁住行为：这里出过一次很严重的错
+         * （录像模式下 VideoCapture 从未进入绑定列表，录像功能整体不可用）。
+         *
+         * 关键约束：
+         * - 录像模式必须包含 [UseCaseSlot.VIDEO_CAPTURE]，否则录像一定失败
+         * - 录像模式**不**绑 IMAGE_CAPTURE：四用例同绑只有 FULL 级设备支持，
+         *   而录像模式本来也没有快门按钮
+         * - 每一级失败都能降级到更小的组合，最后一定保得住预览
+         *
+         * @param videoMode 当前是否为录像模式
+         * @param hasImageCapture ImageCapture 是否已构建
+         * @param hasVideoCapture VideoCapture 是否已构建
+         * @param hasAnalysis ImageAnalysis 是否已构建
+         * @return 候选组合，按优先级从高到低
+         */
+        internal fun useCaseBindingPlan(
+            videoMode: Boolean,
+            hasImageCapture: Boolean,
+            hasVideoCapture: Boolean,
+            hasAnalysis: Boolean
+        ): List<List<UseCaseSlot>> {
+            val candidates = mutableListOf<List<UseCaseSlot>>()
+
+            if (videoMode) {
+                if (hasVideoCapture) {
+                    if (hasAnalysis) {
+                        candidates += listOf(
+                            UseCaseSlot.PREVIEW,
+                            UseCaseSlot.VIDEO_CAPTURE,
+                            UseCaseSlot.IMAGE_ANALYSIS
+                        )
+                    }
+                    candidates += listOf(UseCaseSlot.PREVIEW, UseCaseSlot.VIDEO_CAPTURE)
+                }
+            } else {
+                if (hasImageCapture) {
+                    if (hasAnalysis) {
+                        candidates += listOf(
+                            UseCaseSlot.PREVIEW,
+                            UseCaseSlot.IMAGE_CAPTURE,
+                            UseCaseSlot.IMAGE_ANALYSIS
+                        )
+                    }
+                    candidates += listOf(UseCaseSlot.PREVIEW, UseCaseSlot.IMAGE_CAPTURE)
+                }
+            }
+
+            candidates += listOf(UseCaseSlot.PREVIEW)                          // 兜底：至少保住预览
+            return candidates
+        }
+
+        /**
+         * 设备方向角 -> Surface 旋转常量
+         *
+         * 抽成纯函数便于单测：这段映射写反了的话，横屏拍出来的照片会躺倒
+         * 或者直接上下颠倒，而这类问题在真机上很容易被当成"偶发"。
+         *
+         * 注意映射是"反"的：设备顺时针转 90 度（orientation≈90）时，
+         * 内容需要逆时针补偿，对应 ROTATION_270。
+         *
+         * @param orientation OrientationEventListener 给出的角度（0~359）
+         * @return Surface.ROTATION_*
+         */
+        internal fun orientationToSurfaceRotation(orientation: Int): Int = when {
+            orientation >= 315 || orientation < 45 -> Surface.ROTATION_0
+            orientation < 135 -> Surface.ROTATION_270
+            orientation < 225 -> Surface.ROTATION_180
+            else -> Surface.ROTATION_90
+        }
+    }
+
+    /**
+     * 用例槽位
+     *
+     * 用枚举而不是直接传 UseCase 实例，是为了让组合决策可以脱离 CameraX 单测。
+     */
+    internal enum class UseCaseSlot {
+        PREVIEW,
+        IMAGE_CAPTURE,
+        VIDEO_CAPTURE,
+        IMAGE_ANALYSIS
     }
 
     /**
@@ -206,20 +316,76 @@ class CameraRepositoryImpl @Inject constructor(
      * 失败只记日志：重绑失败不该让当前预览挂掉（旧用例仍可用）。
      */
     private suspend fun rebindForVideoQualityChange() {
+        Log.d(TAG, "rebindForVideoQualityChange: 重新绑定以应用新的录像质量")
+        // 观察设置在 Default 线程上，而用例重建/绑定要在主线程做
+        withContext(Dispatchers.Main) {
+            runCatching { rebindCurrentUseCases() }
+                .onFailure { Log.e(TAG, "rebindForVideoQualityChange: 重绑失败，仍使用原配置", it) }
+        }
+    }
+
+    /**
+     * 按当前模式与设置重建并重绑用例
+     *
+     * 抽出来给"切换录像质量""切换拍照/录像模式"共用。三个要点：
+     * 1. 必须把结果赋回 [camera]：unbindAll 之后旧的 Camera 实例已失效，
+     *    不更新引用会让后续的闪光灯/变焦/曝光全部打在废弃对象上（此前的真实 bug）。
+     * 2. 重建后要重新恢复闪光灯（TORCH 模式需要重新开手电筒）。
+     * 3. 帧处理器是幂等启动的，重复调用安全。
+     */
+    private suspend fun rebindCurrentUseCases() {
         val owner = lifecycleOwner ?: return
         val provider = runCatching { getCameraProvider() }.getOrNull() ?: return
         val previewView = previewViewRef ?: return
 
-        try {
-            Log.d(TAG, "rebindForVideoQualityChange: 重新绑定以应用新的录像质量")
-            provider.unbindAll()
-            buildUseCases(UseCaseConfig(aspectRatio = currentAspectRatio.cameraXRatio, previewView = previewView))
-            bindUseCasesToLifecycle(owner, provider, getCameraSelector(_currentLens.value))
-            Log.d(TAG, "rebindForVideoQualityChange: 重绑完成")
-        } catch (e: Exception) {
-            Log.e(TAG, "rebindForVideoQualityChange: 重绑失败，仍使用原配置", e)
-        }
+        provider.unbindAll()
+        buildUseCases(
+            UseCaseConfig(
+                aspectRatio = currentAspectRatio.cameraXRatio,
+                previewView = previewView
+            )
+        )
+        camera = bindUseCasesToLifecycle(owner, provider, getCameraSelector(_currentLens.value))
+        startFrameProcessor()
+        restoreFlashSettings()
+        updateZoomRange()
+        applyProCaptureOptions()                                             // 重绑后恢复专业模式参数
     }
+
+    /**
+     * 切换用例绑定模式（拍照 / 录像）
+     *
+     * 见 bindUseCasesToLifecycle 的注释：CameraX 不允许把拍照与录像用例
+     * 无脑堆在一起绑，必须按模式重绑，否则录像根本收不到帧。
+     */
+    override suspend fun setVideoMode(videoMode: Boolean): Result<Unit> =
+        withContext(Dispatchers.Main) {
+            if (bindingVideoMode == videoMode) {
+                Log.d(TAG, "setVideoMode: 已处于目标模式 videoMode=$videoMode，无需重绑")
+                return@withContext Result.success(Unit)
+            }
+
+            if (_isRecording.value) {
+                Log.w(TAG, "setVideoMode: 录像进行中，拒绝切换模式")
+                return@withContext Result.failure(Exception("录像中不能切换模式"))
+            }
+
+            bindingVideoMode = videoMode
+            Log.d(TAG, "setVideoMode: 绑定模式 -> ${if (videoMode) "录像" else "拍照"}")
+
+            // 相机尚未绑定时只记标志，下次 bindCamera 会按新标志绑定
+            if (camera == null || lifecycleOwner == null || previewViewRef == null) {
+                return@withContext Result.success(Unit)
+            }
+
+            try {
+                rebindCurrentUseCases()
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "setVideoMode: 重绑失败", e)
+                Result.failure(e)
+            }
+        }
 
     /**
      * 视频质量档位映射到 CameraX 的 Quality
@@ -316,6 +482,36 @@ class CameraRepositoryImpl @Inject constructor(
     // 默认手动ISO值（当切换到手动快门但ISO为自动时使用）
     private val defaultManualIso = 400
 
+    // ==================== 专业模式：Camera2 请求选项的唯一事实来源 ====================
+
+    /**
+     * 专业模式各参数（null = 该项未手动指定，交回相机默认值）
+     *
+     * 这些字段的存在是有原因的：在 CameraX 里
+     * `camera2Control.captureRequestOptions = xxx` 是**整份替换**而不是合并。
+     * 原先每个 setter 各造一份"只含自己那一个 key"的 options，于是后设的参数会把
+     * 先设的整份抹掉 —— 调完白平衡再调 ISO，白平衡就悄悄回到自动了，用户只会觉得
+     * 专业模式"基本没法用"。
+     *
+     * 所以所有参数集中记录在这里，任何一项变化都重新构造一份**完整**的 options 下发。
+     */
+    private var proAwbMode: Int? = null
+    private var proAfMode: Int? = null
+    private var proFocusDistanceDiopters: Float? = null
+    private var proAeMode: Int? = null
+    private var proIso: Int? = null
+    private var proExposureTimeNs: Long? = null
+
+    /**
+     * 自动曝光当前实际使用的曝光时间（纳秒）
+     *
+     * 手动 ISO 必须配 AE_MODE_OFF，而 AE 一旦关闭就必须给出曝光时间，
+     * 否则曝光量完全不可控。用户选"ISO 优先"时想保留的正是自动测光算出来的
+     * 那一档快门，所以这里用 Camera2 会话回调把 AE 的实测曝光时间记下来复用。
+     */
+    @Volatile
+    private var lastAeExposureTimeNs: Long? = null
+
     // CameraX组件
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: androidx.camera.core.Camera? = null               // 相机控制引用
@@ -325,7 +521,178 @@ class CameraRepositoryImpl @Inject constructor(
     private var imageAnalysis: ImageAnalysis? = null                      // 图像分析用例
     private var currentRecording: Recording? = null
     private var recordingFinalizeDeferred: CompletableDeferred<String>? = null  // 用于等待录像完成
+    private var recordingStartDeferred: CompletableDeferred<Unit>? = null       // 用于等待录像真正开始
     private var currentAspectRatio: AspectRatio = AspectRatio.RATIO_4_3  // 当前画幅
+
+    /**
+     * 当前绑定模式是否为录像
+     *
+     * 决定 bindUseCasesToLifecycle 绑定哪一组用例（见该方法注释）。
+     * 由 CameraViewModel 在模式切换时通过 setVideoMode() 更新。
+     */
+    @Volatile
+    private var bindingVideoMode = false
+
+    /**
+     * 上层是否有人在消费分析帧（人像的人脸框、文档的边缘框）
+     *
+     * 由 CameraViewModel 在进入/离开人像、文档模式时设置。没有它的话，
+     * "美颜关到 0 且没选滤镜"时仓库会认为分析帧没人要而丢弃，
+     * 叠加层就冻在最后一次检测结果上。
+     */
+    @Volatile
+    private var analysisConsumerActive = false
+
+    // ==================== 屏幕方向 ====================
+
+    /**
+     * 当前的屏幕方向（Surface.ROTATION_*）
+     *
+     * 这是拍摄旋转的唯一来源。CameraX 的 ImageCapture / ImageAnalysis / VideoCapture
+     * 的 targetRotation **不会**自己跟着设备转（默认恒为 ROTATION_0），而本 App 的
+     * Activity 又在 configChanges 里声明了 orientation，旋转时不会重建，
+     * 于是没有任何一方会去更新它 —— 结果就是横着拍出来的照片永远是躺倒的，
+     * 水印也跟着躺倒（水印是画在这张已经定向好的位图上的）。
+     */
+    @Volatile
+    private var displayRotation = Surface.ROTATION_0
+
+    /** 设备方向监听器（不依赖系统"自动旋转"开关，和系统相机一致） */
+    private var orientationListener: OrientationEventListener? = null
+
+    /** 方向变化后的重绑任务（用于防抖，方向抖动时不做多次重绑） */
+    private var rotationRebindJob: Job? = null
+
+    /**
+     * 是否正在拍摄
+     *
+     * 方向变化要重绑相机（见 scheduleRebindForRotation），而 unbindAll 会让
+     * 正在进行的拍摄失败，所以拍摄期间必须避开。
+     */
+    @Volatile
+    private var captureInFlight = false
+
+    /**
+     * 启动设备方向跟踪
+     *
+     * 用方向传感器而不是读取 display.rotation：用户关掉系统"自动旋转"时，
+     * display.rotation 会一直停在 0，那样横着拍又会躺倒。系统相机同样是
+     * 按设备物理方向决定照片方向的，这里保持一致。
+     */
+    private fun startOrientationTracking() {
+        if (orientationListener != null) return
+
+        val listener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return                   // 手机平放，无法判断
+                applyDisplayRotation(orientationToSurfaceRotation(orientation))
+            }
+        }
+
+        if (listener.canDetectOrientation()) {
+            listener.enable()
+            orientationListener = listener
+            Log.d(TAG, "startOrientationTracking: 方向跟踪已启动")
+        } else {
+            Log.w(TAG, "startOrientationTracking: 设备不支持方向检测，拍摄方向将固定为竖屏")
+        }
+    }
+
+    /**
+     * 停止设备方向跟踪
+     */
+    private fun stopOrientationTracking() {
+        orientationListener?.disable()
+        orientationListener = null
+        Log.d(TAG, "stopOrientationTracking: 方向跟踪已停止")
+    }
+
+    /**
+     * 设备方向角 -> Surface 旋转常量
+     *
+     * 设备顺时针转 90 度时，内容要逆时针补偿，所以映射是"反"的
+     * （45~135 度对应 ROTATION_270，而不是 90）。
+     */
+    private fun orientationToSurfaceRotation(orientation: Int): Int =
+        Companion.orientationToSurfaceRotation(orientation)
+
+    /**
+     * 应用新的屏幕方向到所有产出内容的用例
+     *
+     * 只在方向真的变化时才处理：传感器回调很密集，无脑处理会把预览抖坏。
+     *
+     * 这里除了设置 targetRotation，还要**重绑一次**：
+     * CameraX 的 `setTargetRotation` 只改用例配置，不会通知相机重配拍摄流
+     * （查过 camera-core 1.4.1 的字节码，ImageCapture.setTargetRotation 改完
+     * mUseCaseConfig 就直接返回了），所以光设它，横屏拍出来的照片仍然是竖屏形状 ——
+     * 这正是"横屏拍出来跟竖屏没区别"的原因。重绑才会让新方向真正作用到流上。
+     */
+    private fun applyDisplayRotation(rotation: Int) {
+        if (displayRotation == rotation) return
+        displayRotation = rotation
+        Log.d(TAG, "applyDisplayRotation: 屏幕方向 -> $rotation")
+
+        imageCapture?.targetRotation = rotation
+        imageAnalysis?.targetRotation = rotation
+        videoCapture?.targetRotation = rotation
+
+        scheduleRebindForRotation()
+    }
+
+    /**
+     * 方向变化后重绑相机
+     *
+     * 防抖 + 避开拍摄/录像：手持手机接近 45 度边界时方向会在两档之间反复跳，
+     * 每次跳都重绑会让预览不停闪。
+     */
+    private fun scheduleRebindForRotation() {
+        rotationRebindJob?.cancel()
+        rotationRebindJob = applicationScope.launch {
+            delay(ROTATION_REBIND_DEBOUNCE_MS)
+
+            // 拍摄/录像期间 unbindAll 会让当前这次拍摄失败，等它结束再绑
+            var waited = 0L
+            while ((captureInFlight || _isRecording.value) &&
+                waited < ROTATION_REBIND_MAX_WAIT_MS
+            ) {
+                delay(ROTATION_REBIND_RETRY_MS)
+                waited += ROTATION_REBIND_RETRY_MS
+            }
+
+            if (captureInFlight || _isRecording.value) {
+                Log.w(TAG, "scheduleRebindForRotation: 相机忙，本次方向改动留待下次重绑生效")
+                return@launch
+            }
+
+            withContext(Dispatchers.Main) {
+                runCatching { rebindCurrentUseCases() }
+                    .onFailure { Log.e(TAG, "scheduleRebindForRotation: 重绑失败", it) }
+            }
+        }
+    }
+
+    /**
+     * 把当前记录的方向应用到刚构建出来的用例上
+     *
+     * 用例是重绑时新建的，targetRotation 会回到默认的 ROTATION_0，
+     * 所以每次构建后都要补一次。
+     */
+    private fun applyDisplayRotationToNewUseCases() {
+        // 预览不设：PreviewView 自己按显示方向做变换，重复设置反而可能打架
+        imageCapture?.targetRotation = displayRotation
+        imageAnalysis?.targetRotation = displayRotation
+        videoCapture?.targetRotation = displayRotation
+    }
+
+    /**
+     * 设置上层是否在消费分析帧
+     */
+    override fun setAnalysisConsumerActive(active: Boolean) {
+        if (analysisConsumerActive != active) {
+            Log.d(TAG, "setAnalysisConsumerActive: $active")
+            analysisConsumerActive = active
+        }
+    }
 
     // 生命周期持有者
     private var lifecycleOwner: LifecycleOwner? = null
@@ -354,6 +721,7 @@ class CameraRepositoryImpl @Inject constructor(
      *
      * @param config 用例配置
      */
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun buildUseCases(config: UseCaseConfig) {
         // 构建分辨率选择器（用于Preview和ImageCapture）
         val resolutionSelector = config.aspectRatio?.let { aspectRatio ->
@@ -370,13 +738,35 @@ class CameraRepositoryImpl @Inject constructor(
         }
 
         // 创建拍照用例
-        imageCapture = ImageCapture.Builder().apply {
+        val imageCaptureBuilder = ImageCapture.Builder().apply {
             // 用 MINIMIZE_LATENCY 而不是 MAXIMIZE_QUALITY：
             // 后者是 CameraX 明确的"拿快门延迟换画质"模式，批次连续拍摄时体感很差。
             // 如果更在意单张画质，把下面这行换回 CAPTURE_MODE_MAXIMIZE_QUALITY 即可。
             setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             resolutionSelector?.let { setResolutionSelector(it) }
-        }.build()
+        }
+
+        // 挂一个会话回调，把自动曝光实际使用的曝光时间记下来。
+        // 手动 ISO 必须配 AE_MODE_OFF，而 AE 一关就必须给出曝光时间；
+        // 用户在"ISO 优先"时想保留的正是自动测光算出的那一档快门。
+        Camera2Interop.Extender(imageCaptureBuilder).setSessionCaptureCallback(
+            object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    val exposureTime = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    // 只在自动曝光生效时记录，否则会把手动曝光时间也当成"测光结果"
+                    if (exposureTime != null && exposureTime > 0L &&
+                        proAeMode != CaptureRequest.CONTROL_AE_MODE_OFF
+                    ) {
+                        lastAeExposureTimeNs = exposureTime
+                    }
+                }
+            }
+        )
+        imageCapture = imageCaptureBuilder.build()
 
         // 创建录像用例（分辨率跟随设置页的「视频质量」）
         val recorder = Recorder.Builder()
@@ -408,14 +798,31 @@ class CameraRepositoryImpl @Inject constructor(
             }
 
         Log.d(TAG, "buildUseCases: 用例构建完成 aspectRatio=${config.aspectRatio}")
+
+        // 新用例的 targetRotation 会回到 ROTATION_0，补上当前设备方向，
+        // 否则每次重绑之后横屏拍摄又会躺倒
+        applyDisplayRotationToNewUseCases()
     }
 
     /**
      * 绑定用例到生命周期
      *
-     * 尝试绑定三用例，失败则回退到基本模式
+     * **按模式分别绑定**，而不是"一次绑上所有用例"：
+     *
+     * CameraX 的用例组合是互斥资源，官方支持矩阵里
+     * Preview+ImageCapture+VideoCapture+ImageAnalysis 四用例同绑**只有 FULL 级设备**支持，
+     * 绝大多数手机（LIMITED）会直接抛异常。而原先的实现把 VideoCapture 漏在绑定之外，
+     * 结果就是：Recorder 从未接到相机上，一按录像就收到 Finalize 错误事件
+     * （录像功能完全不可用），同时四用例超限的回退又把 ImageAnalysis 丢掉，
+     * 导致实时滤镜预览在部分机型上静默失效。
+     *
+     * 现在改成：
+     * - 录像模式：Preview + VideoCapture (+ ImageAnalysis)
+     * - 拍照模式：Preview + ImageCapture (+ ImageAnalysis)
+     * 每一级失败都降级到更小的组合，最后至少保住预览。
      *
      * @param owner 生命周期持有者
+     * @param provider CameraProvider
      * @param cameraSelector 相机选择器
      * @return 绑定的相机实例
      */
@@ -424,30 +831,50 @@ class CameraRepositoryImpl @Inject constructor(
         provider: ProcessCameraProvider,
         cameraSelector: CameraSelector
     ): androidx.camera.core.Camera {
-        return try {
-            // 尝试绑定三用例：Preview + ImageCapture + ImageAnalysis
-            provider.bindToLifecycle(
-                owner,
-                cameraSelector,
-                preview,
-                imageCapture,
-                imageAnalysis
-            ).also {
-                Log.d(TAG, "bindUseCasesToLifecycle: 三用例绑定成功")
+        val previewUseCase = preview ?: throw IllegalStateException("Preview未构建")
+
+        val plan = useCaseBindingPlan(
+            videoMode = bindingVideoMode,
+            hasImageCapture = imageCapture != null,
+            hasVideoCapture = videoCapture != null,
+            hasAnalysis = imageAnalysis != null
+        )
+
+        for ((index, slots) in plan.withIndex()) {
+            val useCases = slots.map { slot ->
+                when (slot) {
+                    UseCaseSlot.PREVIEW -> previewUseCase
+                    UseCaseSlot.IMAGE_CAPTURE -> imageCapture!!
+                    UseCaseSlot.VIDEO_CAPTURE -> videoCapture!!
+                    UseCaseSlot.IMAGE_ANALYSIS -> imageAnalysis!!
+                }
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "bindUseCasesToLifecycle: 三用例绑定失败，回退基本模式", e)
-            // 回退：只绑定 Preview + ImageCapture
-            provider.unbindAll()
-            provider.bindToLifecycle(
-                owner,
-                cameraSelector,
-                preview,
-                imageCapture
-            ).also {
-                Log.d(TAG, "bindUseCasesToLifecycle: 基本用例绑定成功")
+
+            try {
+                provider.unbindAll()
+                val bound = provider.bindToLifecycle(
+                    owner,
+                    cameraSelector,
+                    *useCases.toTypedArray()
+                )
+                Log.d(
+                    TAG,
+                    "bindUseCasesToLifecycle: 绑定成功 模式=${if (bindingVideoMode) "录像" else "拍照"} " +
+                        "组合=$index 用例=$slots"
+                )
+                return bound
+            } catch (e: Exception) {
+                Log.w(TAG, "bindUseCasesToLifecycle: 组合$index 绑定失败，尝试降级", e)
             }
         }
+
+        if (bindingVideoMode && videoCapture == null) {
+            Log.e(TAG, "bindUseCasesToLifecycle: 录像模式下 VideoCapture 缺失，录像将不可用")
+        }
+
+        // 理论上到不了这里（兜底组合只有 Preview，绑不上说明相机本身有问题）
+        provider.unbindAll()
+        return provider.bindToLifecycle(owner, cameraSelector, previewUseCase)
     }
 
     /**
@@ -469,15 +896,24 @@ class CameraRepositoryImpl @Inject constructor(
      *
      * @param owner 生命周期持有者
      * @param previewView 预览视图
+     * @param videoMode 本次绑定是否为录像模式
      */
     override suspend fun bindCamera(
         owner: LifecycleOwner,
-        previewView: androidx.camera.view.PreviewView
+        previewView: androidx.camera.view.PreviewView,
+        videoMode: Boolean
     ) {
         withContext(Dispatchers.Main) {
-            Log.d(TAG, "bindCamera: 开始绑定相机")
+            Log.d(TAG, "bindCamera: 开始绑定相机 videoMode=$videoMode")
             this@CameraRepositoryImpl.lifecycleOwner = owner
             this@CameraRepositoryImpl.previewViewRef = previewView
+
+            // 以调用方给的模式为准：本类是单例，沿用旧值会让"退出录像模式再进相机页"
+            // 绑成录像用例，而界面是拍照模式，快门就此失效
+            bindingVideoMode = videoMode
+
+            // 开始跟踪设备方向：横竖屏拍摄都靠它决定照片与水印的方向
+            startOrientationTracking()
 
             try {
                 // 获取CameraProvider
@@ -487,9 +923,10 @@ class CameraRepositoryImpl @Inject constructor(
                 // 解绑之前的用例
                 provider.unbindAll()
 
-                // 重置曝光控制状态（曝光三角）
-                currentShutterSpeed = null                                       // 重置快门速度
-                currentIso = null                                                 // 重置ISO
+                // 注意：这里**不**重置 currentShutterSpeed / currentIso。
+                // Camera2 的请求选项挂在 CameraControl 上，重绑会换成新对象、选项全丢，
+                // 所以重置了也没用；保留用户的选择并在绑定后重新下发，才能让
+                // 专业模式面板上显示的值与实际生效的值保持一致。
 
                 // 构建用例（无指定画幅比例）
                 buildUseCases(UseCaseConfig(previewView = previewView))
@@ -515,6 +952,9 @@ class CameraRepositoryImpl @Inject constructor(
 
                 // 恢复闪光灯设置（重要：TORCH模式需要重新开启手电筒）
                 restoreFlashSettings()
+
+                // 重新下发专业模式参数：重绑后 CameraControl 是新对象，选项会丢
+                applyProCaptureOptions()
 
                 Log.d(TAG, "bindCamera: 相机绑定成功")
             } catch (e: Exception) {
@@ -545,7 +985,8 @@ class CameraRepositoryImpl @Inject constructor(
                 infoWatermarkEnabled = filterRepository.isInfoWatermarkEnabled(),
                 beautyIntensity = beautyIntensity,
                 portraitBlurActive = currentPortraitBlurLevel != PortraitBlurLevel.NONE,
-                hasRawFrame = _rawPreviewFrame.value != null
+                hasRawFrame = _rawPreviewFrame.value != null,
+                externalConsumerActive = analysisConsumerActive
             )
             if (!needed) {
                 // 清掉可能残留的滤镜预览层，避免关掉效果后画面停在旧帧上
@@ -740,6 +1181,8 @@ class CameraRepositoryImpl @Inject constructor(
             Exception("ImageCapture未初始化")
         )
 
+        // 标记拍摄中：方向变化的重绑要避开这期间，否则 unbindAll 会让这次拍摄失败
+        captureInFlight = true
         try {
             val totalStart = System.currentTimeMillis()
             var stageStart = totalStart
@@ -964,6 +1407,8 @@ class CameraRepositoryImpl @Inject constructor(
         } catch (e: Exception) {
             Log.e(TAG, "takePhoto: 拍照异常", e)
             Result.failure(e)
+        } finally {
+            captureInFlight = false
         }
     }
 
@@ -1062,16 +1507,29 @@ class CameraRepositoryImpl @Inject constructor(
 
     /**
      * 开始录像
+     *
+     * 与旧实现的区别（旧的必然报"录像错误"）：
+     * 1. 录像是**异步**的，start() 只是提交请求。旧实现提交完就返回 success，
+     *    上层于是乐观地把"正在录像"置为 true，之后真正的失败只能靠一个
+     *    Finalize 事件飘过来 —— 用户看到的是"点了录像没反应/报错"。
+     *    现在等 Start 事件真的到达才算成功，等不到就报错。
+     * 2. 录像必须绑定了 VideoCapture 才能工作，没绑定时直接给出可读的提示，
+     *    而不是让用户对着一个语焉不详的错误码发呆。
+     * 3. 有录音权限时开启音频轨（CameraX 需要显式 withAudioEnabled）。
      */
     @androidx.annotation.OptIn(androidx.camera.video.ExperimentalPersistentRecording::class)
     override suspend fun startRecording(): Result<Unit> = withContext(Dispatchers.Main) {
-        val capture = videoCapture ?: return@withContext Result.failure(
-            Exception("VideoCapture未初始化")
-        )
-
         if (_isRecording.value) {
             return@withContext Result.failure(Exception("已在录像中"))
         }
+
+        if (!bindingVideoMode) {
+            return@withContext Result.failure(Exception("请先切换到录像模式"))
+        }
+
+        val capture = videoCapture ?: return@withContext Result.failure(
+            Exception("VideoCapture未初始化")
+        )
 
         try {
             Log.d(TAG, "startRecording: 开始录像")
@@ -1082,40 +1540,99 @@ class CameraRepositoryImpl @Inject constructor(
             // 配置输出选项
             val outputOptions = FileOutputOptions.Builder(videoFile).build()
 
-            // 开始录像
-            currentRecording = capture.output
-                .prepareRecording(context, outputOptions)
-                .start(ContextCompat.getMainExecutor(context)) { event ->
-                    when (event) {
-                        is VideoRecordEvent.Start -> {
-                            Log.d(TAG, "startRecording: 录像已开始")
-                            _isRecording.value = true
-                        }
-                        is VideoRecordEvent.Finalize -> {
-                            _isRecording.value = false
-                            if (event.hasError()) {
-                                Log.e(TAG, "startRecording: 录像错误 code=${event.error}")
-                                // 通知等待方录像失败
-                                recordingFinalizeDeferred?.completeExceptionally(
-                                    Exception("录像错误: ${event.error}")
-                                )
-                            } else {
-                                val outputUri = event.outputResults.outputUri
-                                Log.d(TAG, "startRecording: 录像完成 uri=$outputUri")
-                                // 通知等待方录像成功，传递文件路径
-                                val filePath = outputUri.path ?: videoFile.absolutePath
-                                recordingFinalizeDeferred?.complete(filePath)
-                            }
+            // Start 事件到达前先挂一个 Deferred，让 startRecording 能真正"等"到开录
+            val startDeferred = CompletableDeferred<Unit>()
+            recordingStartDeferred = startDeferred
+
+            // 有权限才开音频：没有 RECORD_AUDIO 时 withAudioEnabled 会抛 SecurityException
+            var pending = capture.output.prepareRecording(context, outputOptions)
+            if (hasAudioPermission()) {
+                pending = pending.withAudioEnabled()
+                Log.d(TAG, "startRecording: 已开启录音")
+            } else {
+                Log.w(TAG, "startRecording: 无录音权限，本次录像无声音")
+            }
+
+            currentRecording = pending.start(ContextCompat.getMainExecutor(context)) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> {
+                        Log.d(TAG, "startRecording: 录像已开始")
+                        _isRecording.value = true
+                        startDeferred.complete(Unit)
+                    }
+                    is VideoRecordEvent.Status -> {
+                        // 每次状态更新都会来，这里不打日志以免刷屏
+                    }
+                    is VideoRecordEvent.Finalize -> {
+                        _isRecording.value = false
+                        if (event.hasError()) {
+                            Log.e(
+                                TAG,
+                                "startRecording: 录像结束但有错误 code=${event.error} " +
+                                    "cause=${event.cause?.message}"
+                            )
+                            val error = Exception(
+                                "录像失败：${describeVideoError(event.error)}" +
+                                    (event.cause?.message?.let { "（$it）" } ?: "")
+                            )
+                            // 还没开录就失败 -> 让 startRecording 抛出；否则交给等待方
+                            startDeferred.completeExceptionally(error)
+                            recordingFinalizeDeferred?.completeExceptionally(error)
+                        } else {
+                            val outputUri = event.outputResults.outputUri
+                            Log.d(TAG, "startRecording: 录像完成 uri=$outputUri")
+                            // 通知等待方录像成功，传递文件路径
+                            val filePath = outputUri.path ?: videoFile.absolutePath
+                            recordingFinalizeDeferred?.complete(filePath)
                         }
                     }
                 }
+            }
 
+            // 等真正的 Start 事件（最多 5 秒）
+            withTimeout(START_TIMEOUT_MS) { startDeferred.await() }
+            Log.d(TAG, "startRecording: 录像已确认开始")
             Result.success(Unit)
         } catch (e: Exception) {
             Log.e(TAG, "startRecording: 开始录像失败", e)
-            Result.failure(e)
+            _isRecording.value = false
+            runCatching { currentRecording?.stop() }
+            currentRecording = null
+            Result.failure(
+                if (e is TimeoutCancellationException) Exception("录像启动超时", e) else e
+            )
+        } finally {
+            recordingStartDeferred = null
         }
     }
+
+    /**
+     * 把 CameraX 的录像错误码翻译成人能看懂的话
+     */
+    private fun describeVideoError(code: Int): String = when (code) {
+        VideoRecordEvent.Finalize.ERROR_NONE -> "无错误"
+        VideoRecordEvent.Finalize.ERROR_UNKNOWN -> "未知错误"
+        VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED -> "超出文件大小限制"
+        VideoRecordEvent.Finalize.ERROR_INSUFFICIENT_STORAGE -> "存储空间不足"
+        VideoRecordEvent.Finalize.ERROR_NO_VALID_DATA -> "没有可用的视频数据"
+        VideoRecordEvent.Finalize.ERROR_ENCODING_FAILED -> "编码失败"
+        VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE -> "录像源已失效（请重进相机页）"
+        VideoRecordEvent.Finalize.ERROR_INVALID_OUTPUT_OPTIONS -> "输出参数无效"
+        VideoRecordEvent.Finalize.ERROR_RECORDER_ERROR -> "录像器内部错误"
+        VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED -> "超出时长限制"
+        VideoRecordEvent.Finalize.ERROR_RECORDING_GARBAGE_COLLECTED -> "录像对象已被回收"
+        else -> "错误码 $code"
+    }
+
+    /**
+     * 是否已授予录音权限
+     *
+     * 没有录音权限时不能调用 withAudioEnabled()，否则直接抛异常；
+     * 这里降级为"录无声视频"而不是让整个录像失败。
+     */
+    private fun hasAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     /**
      * 停止录像
@@ -1185,7 +1702,8 @@ class CameraRepositoryImpl @Inject constructor(
                     Exception("PreviewView未设置")
                 )
 
-                bindCamera(owner, pView)
+                // 镜头切换时沿用当前绑定模式（切换前后模式不变）
+                bindCamera(owner, pView, bindingVideoMode)
                 Result.success(Unit)
             } catch (e: Exception) {
                 Log.e(TAG, "switchCamera: 切换摄像头失败", e)
@@ -1687,6 +2205,11 @@ class CameraRepositoryImpl @Inject constructor(
             // 停止帧处理器
             stopFrameProcessor()
 
+            // 停止设备方向跟踪
+            stopOrientationTracking()
+            rotationRebindJob?.cancel()
+            rotationRebindJob = null
+
             // 停止录像
             currentRecording?.stop()
             currentRecording = null
@@ -1784,10 +2307,10 @@ class CameraRepositoryImpl @Inject constructor(
     /**
      * 设置ISO感光度
      *
-     * 使用Camera2 Interop设置ISO
-     * 实现与快门速度的联动（曝光三角）：
-     * - 当快门速度为手动时，保持AE_MODE_OFF
-     * - 当快门速度和ISO都为自动时，才启用AE_MODE_ON
+     * 使用Camera2 Interop设置ISO。曝光三角联动：
+     * - ISO 手动 → 必须同时关掉 AE，否则 SENSOR_SENSITIVITY 会被 AE 算法直接忽略
+     *   （这正是过去"选了 ISO 却毫无变化"的原因），此时沿用 AE 实测的曝光时间
+     * - ISO 与快门都自动 → 恢复 AE_MODE_ON
      *
      * @param iso ISO值，null表示自动
      */
@@ -1795,55 +2318,100 @@ class CameraRepositoryImpl @Inject constructor(
     override suspend fun setIso(iso: Int?): Result<Unit> = withContext(Dispatchers.Main) {
         runCatching {
             Log.d(TAG, "setIso: 设置ISO=$iso, 当前快门速度=$currentShutterSpeed")
-            val cam = camera ?: throw IllegalStateException("相机未初始化")
+            camera ?: throw IllegalStateException("相机未初始化")
 
-            val camera2Control = Camera2CameraControl.from(cam.cameraControl)
-
-            // 更新当前ISO记录
             currentIso = iso
 
-            // 判断是否需要手动曝光模式（曝光三角联动）
-            val isManualExposure = currentShutterSpeed != null || iso != null
-
-            val options = if (iso == null) {
-                // 自动ISO
-                if (currentShutterSpeed != null) {
-                    // 快门为手动，ISO为自动 → 保持AE_MODE_OFF，使用默认ISO
-                    Log.d(TAG, "setIso: 快门手动模式，ISO自动→使用默认ISO=$defaultManualIso")
-                    CaptureRequestOptions.Builder()
-                        .setCaptureRequestOption(
-                            CaptureRequest.CONTROL_AE_MODE,
-                            CaptureRequest.CONTROL_AE_MODE_OFF
-                        )
-                        .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, defaultManualIso)
-                        .build()
+            if (iso == null) {
+                // 回到自动ISO
+                if (currentShutterSpeed == null) {
+                    // 快门也自动 → 完全自动曝光
+                    Log.d(TAG, "setIso: ISO与快门都自动，恢复自动曝光")
+                    proAeMode = CaptureRequest.CONTROL_AE_MODE_ON
+                    proIso = null
+                    proExposureTimeNs = null
                 } else {
-                    // 快门和ISO都为自动 → 启用自动曝光
-                    Log.d(TAG, "setIso: 快门和ISO都自动→启用自动曝光")
-                    CaptureRequestOptions.Builder()
-                        .clearCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY)
-                        .setCaptureRequestOption(
-                            CaptureRequest.CONTROL_AE_MODE,
-                            CaptureRequest.CONTROL_AE_MODE_ON
-                        )
-                        .build()
+                    // 快门手动、ISO 自动 → 仍需 AE_OFF，用一个稳妥的默认 ISO
+                    Log.d(TAG, "setIso: 快门手动，ISO使用默认值=$defaultManualIso")
+                    proAeMode = CaptureRequest.CONTROL_AE_MODE_OFF
+                    proIso = defaultManualIso
                 }
             } else {
-                // 手动ISO
-                Log.d(TAG, "setIso: 手动ISO=$iso, AE_MODE=${if (isManualExposure) "OFF" else "ON"}")
-                CaptureRequestOptions.Builder()
-                    .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
-                    .setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_MODE,
-                        if (currentShutterSpeed != null) CaptureRequest.CONTROL_AE_MODE_OFF
-                        else CaptureRequest.CONTROL_AE_MODE_ON  // ISO手动但快门自动时保持自动曝光
-                    )
-                    .build()
+                Log.d(TAG, "setIso: 手动ISO=$iso，关闭自动曝光以使其生效")
+                proAeMode = CaptureRequest.CONTROL_AE_MODE_OFF
+                proIso = iso
+                if (currentShutterSpeed == null) {
+                    // ISO 优先：沿用自动测光算出的曝光时间
+                    proExposureTimeNs = lastAeExposureTimeNs ?: fallbackExposureNs()
+                }
             }
 
-            camera2Control.captureRequestOptions = options
-            Log.d(TAG, "setIso: ISO设置成功 iso=$iso, isManualExposure=$isManualExposure")
+            applyProCaptureOptions()
             Unit
+        }
+    }
+
+    /**
+     * 下发专业模式的全部参数
+     *
+     * 每次都构造完整的一份并整份替换：没有出现在这里的 key 会回到相机默认值，
+     * 这正是"把某一项改回自动"所需要的语义。
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun applyProCaptureOptions() {
+        val cam = camera ?: return
+        val control = Camera2CameraControl.from(cam.cameraControl)
+
+        val builder = CaptureRequestOptions.Builder()
+        proAwbMode?.let { builder.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, it) }
+        proAfMode?.let { builder.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, it) }
+        proFocusDistanceDiopters?.let {
+            builder.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, it)
+        }
+        proAeMode?.let { builder.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, it) }
+        proIso?.let { builder.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, it) }
+        proExposureTimeNs?.let {
+            builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, it)
+        }
+
+        control.captureRequestOptions = builder.build()
+        Log.d(
+            TAG,
+            "applyProCaptureOptions: awb=$proAwbMode af=$proAfMode " +
+                "focus=${proFocusDistanceDiopters}diopt " +
+                "ae=$proAeMode iso=$proIso exposure=${proExposureTimeNs}ns"
+        )
+    }
+
+    /**
+     * 拿不到 AE 实测曝光时间时的兜底曝光时间（1/30s，并夹到设备支持范围内）
+     */
+    private fun fallbackExposureNs(): Long {
+        val target = 33_333_333L
+        val clamped = exposureTimeRange?.let { target.coerceIn(it.first, it.second) } ?: target
+        Log.w(TAG, "fallbackExposureNs: 尚无AE实测值，使用兜底曝光时间 ${clamped}ns")
+        return clamped
+    }
+
+    /**
+     * 读取设备真实的最近对焦屈光度上限
+     *
+     * 原先写死 10，纯属拍脑袋：真实值各机型不同（常见 5~20），
+     * 写错会让对焦滑块要么全程虚焦、要么在某段区间内怎么拖都不变。
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun maxFocusDistanceDiopters(cam: androidx.camera.core.Camera): Float {
+        val fromCharacteristics = runCatching {
+            Camera2CameraInfo.from(cam.cameraInfo)
+                .getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        }.getOrNull()
+
+        return if (fromCharacteristics != null && fromCharacteristics > 0f) {
+            Log.d(TAG, "maxFocusDistanceDiopters: 设备上报最大屈光度=$fromCharacteristics")
+            fromCharacteristics
+        } else {
+            Log.w(TAG, "maxFocusDistanceDiopters: 设备未上报屈光度范围，退回 10")
+            10f
         }
     }
 
@@ -1858,9 +2426,7 @@ class CameraRepositoryImpl @Inject constructor(
     override suspend fun setWhiteBalance(mode: WhiteBalanceMode): Result<Unit> = withContext(Dispatchers.Main) {
         runCatching {
             Log.d(TAG, "setWhiteBalance: 设置白平衡=${mode.displayName}")
-            val cam = camera ?: throw IllegalStateException("相机未初始化")
-
-            val camera2Control = Camera2CameraControl.from(cam.cameraControl)
+            camera ?: throw IllegalStateException("相机未初始化")
 
             val awbMode = when (mode) {
                 WhiteBalanceMode.AUTO -> CaptureRequest.CONTROL_AWB_MODE_AUTO
@@ -1871,11 +2437,8 @@ class CameraRepositoryImpl @Inject constructor(
                 WhiteBalanceMode.SHADE -> CaptureRequest.CONTROL_AWB_MODE_SHADE
             }
 
-            val options = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, awbMode)
-                .build()
-
-            camera2Control.captureRequestOptions = options
+            proAwbMode = awbMode
+            applyProCaptureOptions()
             Log.d(TAG, "setWhiteBalance: 白平衡设置成功 awbMode=$awbMode")
             Unit
         }
@@ -1892,9 +2455,7 @@ class CameraRepositoryImpl @Inject constructor(
     override suspend fun setFocusMode(mode: FocusMode): Result<Unit> = withContext(Dispatchers.Main) {
         runCatching {
             Log.d(TAG, "setFocusMode: 设置对焦模式=${mode.displayName}")
-            val cam = camera ?: throw IllegalStateException("相机未初始化")
-
-            val camera2Control = Camera2CameraControl.from(cam.cameraControl)
+            camera ?: throw IllegalStateException("相机未初始化")
 
             val afMode = when (mode) {
                 FocusMode.AUTO -> CaptureRequest.CONTROL_AF_MODE_AUTO
@@ -1902,11 +2463,13 @@ class CameraRepositoryImpl @Inject constructor(
                 FocusMode.MANUAL -> CaptureRequest.CONTROL_AF_MODE_OFF
             }
 
-            val options = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, afMode)
-                .build()
+            proAfMode = afMode
+            // 离开手动对焦时清掉手动对焦距离，否则它会在下次切回手动时以旧值突然生效
+            if (mode != FocusMode.MANUAL) {
+                proFocusDistanceDiopters = null
+            }
 
-            camera2Control.captureRequestOptions = options
+            applyProCaptureOptions()
             Log.d(TAG, "setFocusMode: 对焦模式设置成功 afMode=$afMode")
             Unit
         }
@@ -1926,23 +2489,22 @@ class CameraRepositoryImpl @Inject constructor(
             Log.d(TAG, "setFocusDistance: 设置对焦距离=$distance")
             val cam = camera ?: throw IllegalStateException("相机未初始化")
 
-            val camera2Control = Camera2CameraControl.from(cam.cameraControl)
+            // 对焦距离的单位是屈光度（diopters）：0 = 无穷远，越大越近。
+            // 界面上的 distance 语义相反（0=最近，1=无穷远），所以要翻转。
+            // 上限取设备真实上报的 LENS_INFO_MINIMUM_FOCUS_DISTANCE，
+            // 写死一个常数会让滑块与实际对焦范围对不上。
+            val maxDiopters = maxFocusDistanceDiopters(cam)
+            val focusDistanceDiopters = maxDiopters * (1f - distance.coerceIn(0f, 1f))
 
-            // 对焦距离是屈光度（diopters），需要转换
-            // distance=0 表示最近对焦，distance=1 表示无穷远
-            // CameraX的LENS_FOCUS_DISTANCE: 0=无穷远，最大值=最近对焦
-            // 所以需要反转：focusDistance = maxDistance * (1 - distance)
-            // 这里简化处理，使用 0-10 范围作为屈光度
-            val maxFocusDistance = 10f  // 假设最大屈光度为10
-            val focusDistanceDiopters = maxFocusDistance * (1f - distance.coerceIn(0f, 1f))
-
-            val options = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistanceDiopters)
-                .build()
-
-            camera2Control.captureRequestOptions = options
-            Log.d(TAG, "setFocusDistance: 对焦距离设置成功 diopters=$focusDistanceDiopters")
+            // 手动对焦距离只在 AF_MODE_OFF 下有效，这里顺手把对焦模式切过去
+            proAfMode = CaptureRequest.CONTROL_AF_MODE_OFF
+            proFocusDistanceDiopters = focusDistanceDiopters
+            applyProCaptureOptions()
+            Log.d(
+                TAG,
+                "setFocusDistance: 对焦距离设置成功 diopters=$focusDistanceDiopters " +
+                    "(设备上限=$maxDiopters)"
+            )
             Unit
         }
     }
@@ -2233,48 +2795,32 @@ class CameraRepositoryImpl @Inject constructor(
     override suspend fun setShutterSpeed(speed: Float?): Result<Unit> = withContext(Dispatchers.Main) {
         runCatching {
             Log.d(TAG, "setShutterSpeed: 设置快门速度 speed=$speed, 当前ISO=$currentIso")
-            val cam = camera ?: throw IllegalStateException("相机未初始化")
-
-            val camera2Control = Camera2CameraControl.from(cam.cameraControl)
+            camera ?: throw IllegalStateException("相机未初始化")
 
             if (speed == null) {
                 // 恢复自动曝光模式
                 Log.d(TAG, "setShutterSpeed: 恢复自动曝光模式")
                 currentShutterSpeed = null
+                proExposureTimeNs = null
 
-                // 判断是否可以完全恢复自动曝光（ISO也必须是自动）
-                val canAutoExposure = currentIso == null
-
-                val options = CaptureRequestOptions.Builder()
-                    .clearCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME)
-
-                if (canAutoExposure) {
-                    // 快门和ISO都自动 → 完全自动曝光
+                if (currentIso == null) {
+                    // 快门与 ISO 都自动 → 完全自动曝光
                     Log.d(TAG, "setShutterSpeed: ISO也是自动，启用完全自动曝光")
-                    options.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_MODE,
-                        CaptureRequest.CONTROL_AE_MODE_ON
-                    )
-                    options.clearCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY)
+                    proAeMode = CaptureRequest.CONTROL_AE_MODE_ON
+                    proIso = null
                 } else {
-                    // 快门自动但ISO手动 → 保持ISO设置，仅清除快门
+                    // 快门自动但 ISO 手动 → 仍需 AE_OFF，并沿用 AE 实测的曝光时间
                     Log.d(TAG, "setShutterSpeed: ISO为手动($currentIso)，保持半手动模式")
-                    options.setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_MODE,
-                        CaptureRequest.CONTROL_AE_MODE_ON  // CameraX会用ISO hint
-                    )
-                    options.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, currentIso!!)
+                    proAeMode = CaptureRequest.CONTROL_AE_MODE_OFF
+                    proIso = currentIso
+                    proExposureTimeNs = lastAeExposureTimeNs ?: fallbackExposureNs()
                 }
-
-                camera2Control.captureRequestOptions = options.build()
-                Log.d(TAG, "setShutterSpeed: 自动曝光模式已启用 canAutoExposure=$canAutoExposure")
             } else {
-                // 手动快门速度控制
-                // Step 1: 将秒转换为纳秒
+                // Step 1: 秒 -> 纳秒
                 val exposureTimeNs = (speed * 1_000_000_000L).toLong()
                 Log.d(TAG, "setShutterSpeed: 计算曝光时间 ${speed}s = ${exposureTimeNs}ns")
 
-                // Step 2: 限制在设备支持范围内
+                // Step 2: 夹到设备支持范围内
                 val clampedExposureNs = exposureTimeRange?.let { range ->
                     val clamped = exposureTimeNs.coerceIn(range.first, range.second)
                     if (clamped != exposureTimeNs) {
@@ -2282,37 +2828,23 @@ class CameraRepositoryImpl @Inject constructor(
                                 "${exposureTimeNs}ns -> ${clamped}ns")
                     }
                     clamped
-                } ?: exposureTimeNs                                                   // 无范围信息时直接使用
+                } ?: exposureTimeNs
 
-                // Step 3: 确定ISO值（曝光三角联动）
+                // Step 3: 曝光三角联动 —— AE 关闭时必须同时给出 ISO
                 val effectiveIso = currentIso ?: defaultManualIso
-                Log.d(TAG, "setShutterSpeed: 使用ISO=$effectiveIso (原值=${currentIso ?: "自动"})")
 
-                // Step 4: 构建Camera2请求选项（同时设置快门和ISO）
-                val options = CaptureRequestOptions.Builder()
-                    .setCaptureRequestOption(
-                        CaptureRequest.CONTROL_AE_MODE,
-                        CaptureRequest.CONTROL_AE_MODE_OFF                           // 禁用自动曝光
-                    )
-                    .setCaptureRequestOption(
-                        CaptureRequest.SENSOR_EXPOSURE_TIME,
-                        clampedExposureNs                                            // 设置曝光时间
-                    )
-                    .setCaptureRequestOption(
-                        CaptureRequest.SENSOR_SENSITIVITY,
-                        effectiveIso                                                 // 设置ISO
-                    )
-                    .build()
-
-                camera2Control.captureRequestOptions = options
-
-                // 记录当前快门速度
                 currentShutterSpeed = speed
+                proAeMode = CaptureRequest.CONTROL_AE_MODE_OFF
+                proExposureTimeNs = clampedExposureNs
+                proIso = effectiveIso
+
                 Log.d(TAG, "setShutterSpeed: 快门速度设置成功 " +
                         "speed=${formatShutterSpeedLog(speed.toDouble())}, " +
                         "exposureTime=${clampedExposureNs}ns, " +
                         "ISO=$effectiveIso")
             }
+
+            applyProCaptureOptions()
             Unit
         }
     }

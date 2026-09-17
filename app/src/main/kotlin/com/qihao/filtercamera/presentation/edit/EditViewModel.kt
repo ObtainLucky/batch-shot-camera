@@ -22,6 +22,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
@@ -35,6 +36,7 @@ import com.qihao.filtercamera.domain.model.EditHistoryItem
 import com.qihao.filtercamera.domain.model.EditMode
 import com.qihao.filtercamera.domain.model.EditState
 import com.qihao.filtercamera.domain.model.FilterType
+import com.qihao.filtercamera.domain.model.centerCropRect
 import com.qihao.filtercamera.domain.repository.IFilterRepository
 import com.qihao.filtercamera.domain.repository.IMediaRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -70,7 +72,13 @@ class EditViewModel @Inject constructor(
     companion object {
         private const val TAG = "EditViewModel"                               // 日志标签
         private const val MAX_HISTORY_SIZE = 20                               // 最大历史记录数
+
+        /** 连续型操作（滑块拖动）合并进同一条历史的窗口 */
+        private const val HISTORY_COALESCE_MS = 800L
     }
+
+    /** 上一次写入历史的时间戳（elapsedRealtime），用于滑块拖动的历史合并 */
+    private var lastHistoryPushAt = 0L
 
     // ==================== 状态管理 ====================
 
@@ -182,6 +190,7 @@ class EditViewModel @Inject constructor(
 
         _uiState.update { it.copy(adjustParams = newParams) }
         applyEdits()
+        pushHistory(coalesce = true)                                      // 滑块：连续拖动合并成一步
     }
 
     /**
@@ -208,7 +217,7 @@ class EditViewModel @Inject constructor(
         Log.d(TAG, "resetAdjustParams: 重置所有调整参数")
         _uiState.update { it.copy(adjustParams = AdjustParams()) }
         applyEdits()
-        addHistoryItem()
+        pushHistory()
     }
 
     // ==================== 裁剪功能 ====================
@@ -221,6 +230,8 @@ class EditViewModel @Inject constructor(
         _uiState.update {
             it.copy(cropState = it.cropState.copy(cropRatio = ratio))
         }
+        applyEdits()                                                      // 比例要真的裁到图上
+        pushHistory()
     }
 
     /**
@@ -244,6 +255,7 @@ class EditViewModel @Inject constructor(
             it.copy(cropState = it.cropState.copy(rotation = newRotation))
         }
         applyEdits()
+        pushHistory()
     }
 
     /**
@@ -257,6 +269,7 @@ class EditViewModel @Inject constructor(
             it.copy(cropState = it.cropState.copy(isFlippedHorizontal = !currentFlip))
         }
         applyEdits()
+        pushHistory()
     }
 
     /**
@@ -270,6 +283,7 @@ class EditViewModel @Inject constructor(
             it.copy(cropState = it.cropState.copy(isFlippedVertical = !currentFlip))
         }
         applyEdits()
+        pushHistory()
     }
 
     /**
@@ -296,6 +310,7 @@ class EditViewModel @Inject constructor(
         Log.d(TAG, "selectFilter: 选择滤镜 -> ${filterType.name}")
         _uiState.update { it.copy(filterType = filterType) }
         applyEdits()
+        pushHistory()
     }
 
     /**
@@ -306,6 +321,7 @@ class EditViewModel @Inject constructor(
         Log.d(TAG, "setFilterIntensity: 设置强度 $clampedIntensity")
         _uiState.update { it.copy(filterIntensity = clampedIntensity) }
         applyEdits()
+        pushHistory(coalesce = true)                                      // 滑块：连续拖动合并成一步
     }
 
     // ==================== 编辑应用 ====================
@@ -347,6 +363,13 @@ class EditViewModel @Inject constructor(
 
     /**
      * 应用裁剪变换
+     *
+     * 顺序很重要：先旋转/翻转，再裁剪。反过来的话，旋转会把已经裁好的矩形
+     * 一起转过去，得到的位置就全错位了。
+     *
+     * 裁剪范围有两种来源：
+     * - cropRect 非空：按比例坐标（0~1）裁，留给以后做手势裁剪框用
+     * - 否则按所选宽高比居中裁剪（1:1 / 4:3 / 16:9 ...）
      */
     private fun applyCropTransform(source: Bitmap, cropState: CropState): Bitmap {
         if (!cropState.hasTransforms()) return source
@@ -366,7 +389,44 @@ class EditViewModel @Inject constructor(
             matrix.postScale(1f, -1f, source.width / 2f, source.height / 2f)
         }
 
-        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+        val transformed =
+            Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+
+        val rect = cropState.cropRect
+        if (rect != null && !rect.isEmpty && rect.width() > 0f && rect.height() > 0f) {
+            val w = transformed.width
+            val h = transformed.height
+            val left = (rect.left * w).toInt().coerceIn(0, w - 1)
+            val top = (rect.top * h).toInt().coerceIn(0, h - 1)
+            val right = (rect.right * w).toInt().coerceIn(left + 1, w)
+            val bottom = (rect.bottom * h).toInt().coerceIn(top + 1, h)
+            Log.d(
+                TAG,
+                "applyCropTransform: 按裁剪框裁剪 rect=$rect -> " +
+                    "${right - left}x${bottom - top}"
+            )
+            return Bitmap.createBitmap(transformed, left, top, right - left, bottom - top)
+        }
+
+        return cropToAspect(transformed, cropState.cropRatio)
+    }
+
+    /**
+     * 按目标宽高比居中裁剪
+     *
+     * 具体的裁剪矩形由 centerCropRect 这个纯函数算（可单测），
+     * 这里只负责把结果落到 Bitmap 上。
+     */
+    private fun cropToAspect(source: Bitmap, ratio: CropRatio): Bitmap {
+        val rect = centerCropRect(source.width, source.height, ratio.getAspectRatio())
+        if (rect == null) return source
+
+        Log.d(
+            TAG,
+            "cropToAspect: ${ratio.displayName} ${source.width}x${source.height} " +
+                "-> ${rect[2]}x${rect[3]} @ (${rect[0]}, ${rect[1]})"
+        )
+        return Bitmap.createBitmap(source, rect[0], rect[1], rect[2], rect[3])
     }
 
     /**
@@ -432,7 +492,9 @@ class EditViewModel @Inject constructor(
      * 应用滤镜
      */
     private fun applyFilter(source: Bitmap, filterType: FilterType, intensity: Float): Bitmap {
-        return filterRepository.applyFilterToBitmapSync(filterType, source) ?: source
+        // 必须带上 intensity：不带强度的重载读的是仓库里的单例强度（相机页在用），
+        // 编辑器调它等于"用相机的强度渲染编辑器的图"，滑块拖了也没反应
+        return filterRepository.applyFilterToBitmapSync(filterType, source, intensity) ?: source
     }
 
     // ==================== 对比原图 ====================
@@ -484,6 +546,42 @@ class EditViewModel @Inject constructor(
                 history = newHistory,
                 historyIndex = newHistory.size - 1
             )
+        }
+    }
+
+    /**
+     * 记录一次历史（连续型操作合并为一条）
+     *
+     * 抽这一层是因为滑块：拖动一次会调用 updateAdjustParam 几十遍，每次都入栈
+     * 的话"撤销"要点几十下才退回上一步，而且 MAX_HISTORY_SIZE 会被瞬间冲光。
+     * 所以连续型操作在 [HISTORY_COALESCE_MS] 窗口内只覆盖栈顶，不新增。
+     *
+     * 旋转/翻转/选滤镜这类离散操作传 coalesce=false，各自成为独立的一步。
+     *
+     * @param coalesce 是否允许与上一条历史合并
+     */
+    private fun pushHistory(coalesce: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        val shouldCoalesce = coalesce &&
+            _uiState.value.history.isNotEmpty() &&
+            _uiState.value.historyIndex >= 0 &&
+            now - lastHistoryPushAt < HISTORY_COALESCE_MS
+
+        lastHistoryPushAt = now
+
+        if (shouldCoalesce) {
+            // 覆盖栈顶：把当前状态写回最后一条，而不是新增一条
+            val state = _uiState.value
+            val newHistory = state.history.toMutableList()
+            newHistory[state.historyIndex] = EditHistoryItem(
+                adjustParams = state.adjustParams,
+                cropState = state.cropState,
+                filterType = state.filterType,
+                filterIntensity = state.filterIntensity
+            )
+            _uiState.update { it.copy(history = newHistory) }
+        } else {
+            addHistoryItem()
         }
     }
 

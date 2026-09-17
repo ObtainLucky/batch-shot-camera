@@ -329,11 +329,8 @@ class MediaRepositoryImpl @Inject constructor(
     private fun batchRelativePath(batch: BatchConfig): String {
         // 层级顺序由 BatchConfig.relativeSubPath 统一决定：目录 / 日期 / 轮次
         // （日期在外、轮次在内，按天翻看时同一天的各轮次收在同一个日期目录下）
-        val dateStamp = if (batch.dateSubDir) {
-            SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-        } else {
-            null
-        }
+        // 日期戳走 BatchConfig.dateStampFor：存盘、界面显示、按磁盘同步都必须同格式
+        val dateStamp = if (batch.dateSubDir) BatchConfig.dateStampFor() else null
         return "${Environment.DIRECTORY_PICTURES}/${batch.relativeSubPath(dateStamp)}"
     }
 
@@ -415,15 +412,55 @@ class MediaRepositoryImpl @Inject constructor(
      * 保存视频到相册
      */
     override suspend fun saveVideo(videoPath: String, fileName: String): Result<Uri> =
+        saveVideoInternal(videoPath, fileName, defaultVideoRelativePath())
+
+    /**
+     * 保存视频到相册（批次模式）
+     *
+     * 批次子目录沿用照片那套（目录/日期/轮次），只是顶级目录换成 Movies ——
+     * Scoped Storage 不接受把视频写进 Pictures。日期戳的算法与照片保持一致，
+     * 免得同一天的批次在照片和视频里落到不同目录。
+     */
+    override suspend fun saveVideo(
+        videoPath: String,
+        fileName: String,
+        batch: BatchConfig?
+    ): Result<Uri> {
+        if (batch == null) return saveVideo(videoPath, fileName)
+
+        val dateStamp = if (batch.dateSubDir) BatchConfig.dateStampFor() else null
+        val relativePath =
+            "${Environment.DIRECTORY_MOVIES}/${batch.relativeSubPath(dateStamp)}"
+        return saveVideoInternal(videoPath, fileName, relativePath)
+    }
+
+    /**
+     * 视频默认保存目录（未选批次时）
+     */
+    private fun defaultVideoRelativePath(): String =
+        "${Environment.DIRECTORY_MOVIES}/$ALBUM_NAME"
+
+    /**
+     * 保存视频到相册（内部实现）
+     */
+    private suspend fun saveVideoInternal(
+        videoPath: String,
+        fileName: String,
+        relativePath: String
+    ): Result<Uri> =
         withContext(Dispatchers.IO) {
             try {
-                Log.d(TAG, "saveVideo: 开始保存视频 videoPath=$videoPath, fileName=$fileName")
+                Log.d(
+                    TAG,
+                    "saveVideo: 开始保存视频 videoPath=$videoPath, fileName=$fileName, " +
+                        "path=$relativePath"
+                )
                 val sourceFile = File(videoPath)
                 if (!sourceFile.exists()) {
                     return@withContext Result.failure(Exception("视频源文件不存在: $videoPath"))
                 }
 
-                val contentValues = createVideoContentValues(fileName)
+                val contentValues = createVideoContentValues(fileName, relativePath)
                 val uri = context.contentResolver.insert(
                     MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     contentValues
@@ -778,12 +815,12 @@ class MediaRepositoryImpl @Inject constructor(
     /**
      * 创建视频ContentValues
      */
-    private fun createVideoContentValues(fileName: String): ContentValues {
+    private fun createVideoContentValues(fileName: String, relativePath: String): ContentValues {
         return ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, "$fileName$VIDEO_EXTENSION")
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/$ALBUM_NAME")
+                put(MediaStore.Video.Media.RELATIVE_PATH, relativePath)
                 put(MediaStore.Video.Media.IS_PENDING, 1)
             }
         }
@@ -907,7 +944,12 @@ class MediaRepositoryImpl @Inject constructor(
 
         // 「自动保存」关闭时拍的照片落在应用私有目录，系统相册看不到；
         // 这里把它们一并纳入，否则那些照片在 App 里也是黑洞。
-        result.addAll(listPrivateShots())
+        //
+        // 只在第一页并入：翻页时每页都会重跑这个函数，无条件追加会让同一批私有照片
+        // 在列表里重复出现（还会撞上 LazyVerticalGrid 的重复 key 直接崩）。
+        if (!applyPaging || offset == 0) {
+            result.addAll(listPrivateShots())
+        }
     }
 
     /**
@@ -1007,13 +1049,17 @@ class MediaRepositoryImpl @Inject constructor(
     private fun getImageCount(): Int {
         val (albumSelection, albumSelectionArgs) = buildAlbumSelection()
 
-        return context.contentResolver.query(
+        val mediaStoreCount = context.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             arrayOf(MediaStore.Images.Media._ID),
             albumSelection,
             albumSelectionArgs,
             null
         )?.use { it.count } ?: 0
+
+        // 私有目录里的照片也算总数：否则列表里明明有它们，标题却少算，
+        // hasMoreData 的判断也会跟着偏
+        return mediaStoreCount + listPrivateShots().size
     }
 
     /**
