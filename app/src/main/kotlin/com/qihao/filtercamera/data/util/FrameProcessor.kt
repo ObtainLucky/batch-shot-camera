@@ -61,20 +61,37 @@ fun interface FrameProcessCallback {
  * 异步帧处理器
  *
  * @param bufferCapacity 帧缓冲区容量
- * @param processingIntervalMs 处理间隔（毫秒），控制处理帧率
+ * @param processingIntervalMs 初始处理间隔（毫秒），可用 [setProcessingInterval] 动态调整
  */
 class FrameProcessor(
     private val bufferCapacity: Int = 3,
-    private val processingIntervalMs: Long = 33L              // 默认30fps
+    processingIntervalMs: Long = 33L              // 默认30fps
 ) {
 
     companion object {
         private const val TAG = "FrameProcessor"
         private const val STATS_LOG_INTERVAL = 100            // 每100帧输出一次统计
+
+        /** 处理间隔的合法范围（16ms≈60fps 下限，500ms≈2fps 上限） */
+        private const val MIN_INTERVAL_MS = 16L
+        private const val MAX_INTERVAL_MS = 500L
     }
 
     // 帧缓冲区
     private val frameBuffer = FrameRingBuffer(bufferCapacity)
+
+    // 处理间隔（可动态调整：纯水印模式降到 20fps 省电省 CPU，GPU 滤镜保持满帧）
+    @Volatile
+    private var processingIntervalMs = processingIntervalMs.coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+
+    /**
+     * 动态调整处理间隔
+     *
+     * 在处理协程内调用是安全的：下一次循环立即生效。
+     */
+    fun setProcessingInterval(intervalMs: Long) {
+        processingIntervalMs = intervalMs.coerceIn(MIN_INTERVAL_MS, MAX_INTERVAL_MS)
+    }
 
     // 处理器协程作用域
     private var processorScope: CoroutineScope? = null

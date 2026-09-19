@@ -61,6 +61,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -93,6 +94,7 @@ import com.qihao.filtercamera.domain.repository.PhotoQuality
 import com.qihao.filtercamera.domain.repository.SaveLocation
 import com.qihao.filtercamera.domain.repository.ThemeMode
 import com.qihao.filtercamera.domain.repository.VideoQuality
+import com.qihao.filter.watermark.WatermarkRenderer
 
 /**
  * 设置页面
@@ -259,6 +261,13 @@ fun SettingsScreen(
                         WatermarkSizeSlider(
                             scale = uiState.watermarkSizeScale,
                             onScaleChange = viewModel::setWatermarkSizeScale
+                        )
+                    }
+
+                    item {
+                        WatermarkPositionSelector(
+                            selected = uiState.watermarkPosition,
+                            onSelected = viewModel::setWatermarkPosition
                         )
                     }
                 }
@@ -598,6 +607,45 @@ private fun WatermarkSizeSlider(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+    }
+}
+
+/**
+ * 水印位置选择
+ *
+ * 作用于信息类水印（信息面板/工程表格/大字时间/极简胶囊），默认左下角。
+ * 极简胶囊始终水平居中，这里只决定它靠上还是靠下。
+ */
+@Composable
+private fun WatermarkPositionSelector(
+    selected: WatermarkRenderer.WatermarkPosition,
+    onSelected: (WatermarkRenderer.WatermarkPosition) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        )
+    ) {
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(text = "水印位置", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                text = "信息面板/工程表格/大字时间/极简胶囊都跟随这个位置",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                WatermarkRenderer.WatermarkPosition.entries.forEach { position ->
+                    FilterChip(
+                        selected = position == selected,
+                        onClick = { onSelected(position) },
+                        label = { Text(text = position.label) }
+                    )
+                }
             }
         }
     }

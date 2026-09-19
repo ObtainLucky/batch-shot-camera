@@ -1682,6 +1682,17 @@ class CameraViewModel @Inject constructor(
     }
 
     /**
+     * 上报预览取景框的实际显示尺寸
+     *
+     * 预览水印要锚定在"看得见的区域"内（全屏铺满时取景框与水印位图比例
+     * 不一致，Crop 会裁掉位图边缘），裁切比例取决于取景框的真实尺寸，
+     * 由界面在尺寸变化时（旋转/画幅切换）上报。
+     */
+    fun onPreviewBoxSizeChanged(widthPx: Int, heightPx: Int) {
+        useCase.setPreviewBoxSize(widthPx, heightPx)
+    }
+
+    /**
      * 切换模式菜单可见性
      * 使用PopupStateHolder实现互斥
      * 模式菜单整合了HDR、定时器、画幅比例、滤镜等功能入口

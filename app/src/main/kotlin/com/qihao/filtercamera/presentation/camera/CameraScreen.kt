@@ -88,6 +88,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -386,50 +387,6 @@ private fun CameraContent(
         val topStartInset = if (isLandscape) 56.dp else dimens.spacing.lg
         val topEndInset = if (isLandscape) 112.dp else dimens.spacing.lg
 
-        // 横屏：控件收进两侧黑边
-        //
-        // 横屏取景框是 4:3、只占屏幕中间 1440/2400 宽度，两侧各有一条黑边，
-        // 正好用来放控件：画面保持完整不被遮挡，顶部也不会被挤得往下沉。
-        // 快门落在右侧中部 —— 单手横持时拇指最顺的位置。
-        if (isLandscape) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(start = dimens.spacing.xs)
-            ) {
-                CameraModeSelectorVertical(
-                    currentMode = uiState.mode,
-                    onModeSelected = viewModel::selectMode
-                )
-            }
-            Column(
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = dimens.spacing.xs),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(dimens.spacing.sm)
-            ) {
-                ZoomIndicator(
-                    currentZoom = uiState.advancedSettings.zoomLevel,
-                    isExpanded = uiState.isZoomSliderVisible,
-                    onClick = viewModel::toggleZoomSlider
-                )
-                NewCameraBottomControlsVertical(
-                    galleryThumbnail = galleryThumbnail,
-                    onGalleryClick = onNavigateToGallery,
-                    onShutterClick = {
-                        if (CameraMode.isVideoMode(uiState.mode)) {
-                            viewModel.toggleRecording()
-                        } else {
-                            viewModel.takePhoto()
-                        }
-                    },
-                    onSwitchCameraClick = viewModel::switchCamera,
-                    modifier = Modifier
-                )
-            }
-        }
-
         // 1. 相机预览容器 - 根据画幅比例调整大小
         //
         // 比例必须跟着屏幕方向换：手机横过来之后，同一个 4:3 画幅在界面上就是 4:3
@@ -447,19 +404,28 @@ private fun CameraContent(
             AspectRatio.RATIO_16_9 -> 9f / 16f                            // 竖屏 宽:高 = 9:16
             AspectRatio.RATIO_FULL -> null                                // 全屏：不限制比例
         }
-        val previewModifier = if (portraitRatio == null) {
-            Modifier.fillMaxSize()                                        // 全屏填满
+        val previewModifier = if (portraitRatio == null || isLandscape) {
+            // 全屏铺满的两种情况：
+            // 1. 画幅=全屏（portraitRatio == null）
+            // 2. 横屏——4:3/16:9 的比例窗口横过来放，在 20:9 长屏上两侧各留 ~470px 黑边，
+            //    取景面积观感比竖屏还小；铺满后画面占满全宽，两侧控制列直接叠在画面上。
+            //    画幅设置仍决定成片比例，横屏预览显示的是成片中央的裁切（与系统相机一致）。
+            Modifier.fillMaxSize()
         } else {
-            // 横屏时取倒数，把"竖屏的宽:高"换成"横屏的宽:高"
-            val displayRatio = if (isLandscape) 1f / portraitRatio else portraitRatio
+            // 竖屏：按画幅比例居中。竖屏时比例窗口本来就占满整屏宽，
+            // 只有上下留边，不存在"面积被浪费"的观感问题。
             Modifier
-                .aspectRatio(displayRatio)
+                .aspectRatio(portraitRatio)
                 .align(Alignment.Center)
         }
 
         // 预览区域Box（包含相机预览和滤镜叠加层）
+        // onSizeChanged：把取景框实际尺寸上报给水印渲染链——
+        // 全屏铺满时取景框与位图比例不一致，水印要锚定在裁切后的可见区内
         Box(
-            modifier = previewModifier,
+            modifier = previewModifier.onSizeChanged { size ->
+                viewModel.onPreviewBoxSizeChanged(size.width, size.height)
+            },
             contentAlignment = Alignment.Center
         ) {
             // 1.1 相机预览（前置 + 开启镜像时水平翻转）
@@ -527,6 +493,53 @@ private fun CameraContent(
                                 viewModel.onPreviewTouchFocus(releaseNormalizedX, releaseNormalizedY)
                             }
                         }
+                )
+            }
+        }
+
+        // 1.5 横屏两侧控制列（必须声明在预览层**之后**）
+        //
+        // Compose 的 Box 按声明顺序绘制，后声明的画在上层。
+        // 预览全屏铺满后是不透明位图，若控制列声明在它之前，会被整层盖住——
+        // 快门、切换相机、模式列全部"消失"。放在预览之后即压在画面上。
+        //
+        // 控件直接叠在画面上（与系统相机一致）；快门落在右侧中部，
+        // 单手横持时拇指最顺的位置。
+        if (isLandscape) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .padding(start = dimens.spacing.xs)
+            ) {
+                CameraModeSelectorVertical(
+                    currentMode = uiState.mode,
+                    onModeSelected = viewModel::selectMode
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = dimens.spacing.xs),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(dimens.spacing.sm)
+            ) {
+                ZoomIndicator(
+                    currentZoom = uiState.advancedSettings.zoomLevel,
+                    isExpanded = uiState.isZoomSliderVisible,
+                    onClick = viewModel::toggleZoomSlider
+                )
+                NewCameraBottomControlsVertical(
+                    galleryThumbnail = galleryThumbnail,
+                    onGalleryClick = onNavigateToGallery,
+                    onShutterClick = {
+                        if (CameraMode.isVideoMode(uiState.mode)) {
+                            viewModel.toggleRecording()
+                        } else {
+                            viewModel.takePhoto()
+                        }
+                    },
+                    onSwitchCameraClick = viewModel::switchCamera,
+                    modifier = Modifier
                 )
             }
         }

@@ -68,6 +68,9 @@ object SettingsKeys {
     /** 水印大小倍率键 - 浮点，1.0 为基准 */
     val WATERMARK_SIZE_SCALE = floatPreferencesKey("watermark_size_scale")
 
+    /** 水印位置键 - 存储 WatermarkPosition 的 id（bottom_left 等） */
+    val WATERMARK_POSITION = stringPreferencesKey("watermark_position")
+
     // ==================== 保存位置设置 ====================
 
     /** 保存位置键 - 存储枚举名称 */
@@ -155,6 +158,9 @@ object SettingsDefaults {
 
     /** 水印大小默认 1.0 倍 */
     const val WATERMARK_SIZE_SCALE = 1.0f
+
+    /** 水印默认位置 - 左下角（与历史版本行为一致） */
+    const val WATERMARK_POSITION = "bottom_left"
 
     // ==================== 保存位置设置默认值 ====================
 

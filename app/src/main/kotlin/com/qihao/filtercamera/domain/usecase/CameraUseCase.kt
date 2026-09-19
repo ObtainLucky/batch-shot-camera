@@ -361,6 +361,12 @@ class CameraUseCase @Inject constructor(
         FilterType.getFiltersByGroup(group)
 
     /**
+     * 上报预览取景框的实际显示尺寸（供预览水印锚定可见区，见 IFilterRepository）
+     */
+    fun setPreviewBoxSize(widthPx: Int, heightPx: Int) =
+        filter.setPreviewBoxSize(widthPx, heightPx)
+
+    /**
      * 获取滤镜帧流（用于实时预览显示）
      *
      * 当应用滤镜时返回处理后的Bitmap，否则返回null

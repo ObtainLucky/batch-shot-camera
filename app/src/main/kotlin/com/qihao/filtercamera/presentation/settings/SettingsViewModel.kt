@@ -26,6 +26,7 @@ import com.qihao.filtercamera.domain.repository.PhotoQuality
 import com.qihao.filtercamera.domain.repository.SaveLocation
 import com.qihao.filtercamera.domain.repository.ThemeMode
 import com.qihao.filtercamera.domain.repository.VideoQuality
+import com.qihao.filter.watermark.WatermarkRenderer
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -66,6 +67,8 @@ data class SettingsUiState(
     val watermarkText: String = "FilterCamera",                           // 备注文字
     val watermarkFields: Set<WatermarkField> = WatermarkField.DEFAULT,     // 信息水印启用的字段
     val watermarkSizeScale: Float = 1.0f,                                  // 水印大小倍率（1.0 为基准）
+    val watermarkPosition: WatermarkRenderer.WatermarkPosition =
+        WatermarkRenderer.WatermarkPosition.DEFAULT,                       // 水印位置（默认左下）
     val saveLocation: SaveLocation = SaveLocation.DCIM,                   // 保存位置
     val customSavePath: String = "",                                      // 自定义保存路径
     val defaultFilter: FilterType = FilterType.NONE,                      // 默认滤镜
@@ -163,6 +166,13 @@ class SettingsViewModel @Inject constructor(
         viewModelScope.launch {
             settingsRepository.getWatermarkSizeScale().collect { scale ->
                 _uiState.update { it.copy(watermarkSizeScale = scale) }
+            }
+        }
+
+        // 水印位置
+        viewModelScope.launch {
+            settingsRepository.getWatermarkPosition().collect { position ->
+                _uiState.update { it.copy(watermarkPosition = position) }
             }
         }
 
@@ -309,6 +319,18 @@ class SettingsViewModel @Inject constructor(
         Log.d(TAG, "setWatermarkSizeScale: $scale")
         viewModelScope.launch {
             settingsRepository.setWatermarkSizeScale(scale)
+        }
+    }
+
+    /**
+     * 设置水印位置
+     *
+     * @param position 四角位置之一
+     */
+    fun setWatermarkPosition(position: WatermarkRenderer.WatermarkPosition) {
+        Log.d(TAG, "setWatermarkPosition: ${position.id}")
+        viewModelScope.launch {
+            settingsRepository.setWatermarkPosition(position)
         }
     }
 

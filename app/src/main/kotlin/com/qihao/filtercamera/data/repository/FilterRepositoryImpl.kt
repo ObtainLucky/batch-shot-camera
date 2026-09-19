@@ -182,11 +182,15 @@ class FilterRepositoryImpl @Inject constructor(
      * @param sourceBitmap 源图片
      * @return 应用滤镜后的图片
      */
-    private fun applyFilterInternal(filterType: FilterType, sourceBitmap: Bitmap): Bitmap? {
+    private fun applyFilterInternal(
+        filterType: FilterType,
+        sourceBitmap: Bitmap,
+        forPreview: Boolean = false
+    ): Bitmap? {
         // 第一步：算滤镜结果
         val filtered = applyFilterCore(filterType, sourceBitmap)
         // 第二步：按设置叠加信息水印（与滤镜选择相互独立，类似相机的日期印字）
-        return decorateWithInfoWatermarkIfNeeded(filterType, filtered)
+        return decorateWithInfoWatermarkIfNeeded(filterType, filtered, forPreview)
     }
 
     /**
@@ -242,14 +246,15 @@ class FilterRepositoryImpl @Inject constructor(
      */
     private fun decorateWithInfoWatermarkIfNeeded(
         filterType: FilterType,
-        bitmap: Bitmap?
+        bitmap: Bitmap?,
+        forPreview: Boolean = false
     ): Bitmap? {
         if (bitmap == null) return null
         if (!watermarkInfoProvider.isInfoWatermarkEnabled()) return bitmap
         if (FilterType.isWatermarkType(filterType)) return bitmap            // 已选水印，避免重复叠加
 
-        Log.d(TAG, "decorateWithInfoWatermarkIfNeeded: 叠加信息水印（设置已开启）")
-        return applyWatermarkToBitmap(FilterType.WATERMARK_INFO, bitmap)
+        // 预览链路每帧调用，不打日志
+        return applyWatermarkToBitmap(FilterType.WATERMARK_INFO, bitmap, forPreview)
     }
 
     /**
@@ -389,8 +394,8 @@ class FilterRepositoryImpl @Inject constructor(
      * @return 应用滤镜后的图片
      */
     override fun applyFilterToBitmapSync(filterType: FilterType, sourceBitmap: Bitmap): Bitmap? {
-        Log.d(TAG, "applyFilterToBitmapSync: 同步应用滤镜 filterType=$filterType")
-        return applyFilterInternal(filterType, sourceBitmap)
+        // 预览链路每帧调用，不打日志；forPreview=true 让水印锚定在取景窗可见区内
+        return applyFilterInternal(filterType, sourceBitmap, forPreview = true)
     }
 
     /**
@@ -458,21 +463,84 @@ class FilterRepositoryImpl @Inject constructor(
      * @param sourceBitmap 源图片
      * @return 带水印的图片
      */
-    private fun applyWatermarkToBitmap(filterType: FilterType, sourceBitmap: Bitmap): Bitmap {
-        // 时间戳取拍照/预览当下的时间，其余字段（经纬度/地址/天气/备注）取快照
-        val data = currentWatermarkData().copy(timestamp = System.currentTimeMillis())
+    private fun applyWatermarkToBitmap(
+        filterType: FilterType,
+        sourceBitmap: Bitmap,
+        forPreview: Boolean = false
+    ): Bitmap {
+        // 时间戳取拍照/预览当下的时间，其余字段（经纬度/地址/天气/备注）取快照。
+        // 预览路径把取景窗四边裁切比例传给渲染器，水印锚点收进可见区；
+        // 成片没有裁切，inset 恒为 0。
+        val insets = if (forPreview) previewEdgeInsets(sourceBitmap) else null
+        val data = currentWatermarkData().copy(
+            timestamp = System.currentTimeMillis(),
+            edgeInsetTop = insets?.top ?: 0f,
+            edgeInsetBottom = insets?.bottom ?: 0f,
+            edgeInsetLeft = insets?.left ?: 0f,
+            edgeInsetRight = insets?.right ?: 0f
+        )
 
         // 转换FilterType到WatermarkType
         val watermarkType = filterTypeToWatermarkType(filterType)
 
-        Log.d(
-            TAG,
-            "applyWatermarkToBitmap: 应用水印 type=$watermarkType, " +
-                "有定位=${data.latitude != null}, 有地址=${!data.address.isNullOrBlank()}, " +
-                "有天气=${!data.weather.isNullOrBlank()}, 有备注=${data.customText.isNotBlank()}"
-        )
+        // 预览链路每帧都会走到这里，不再打日志（30fps × 2 条日志本身就是可观的开销）
 
         return WatermarkRenderer.applyWatermark(sourceBitmap, watermarkType, data)
+    }
+
+    /** 预览取景框实际尺寸（px），UI 层测量后上报；0 表示尚未测量 */
+    @Volatile
+    private var previewBoxWidth = 0
+
+    @Volatile
+    private var previewBoxHeight = 0
+
+    override fun setPreviewBoxSize(widthPx: Int, heightPx: Int) {
+        if (widthPx != previewBoxWidth || heightPx != previewBoxHeight) {
+            Log.d(TAG, "setPreviewBoxSize: ${widthPx}x$heightPx")
+        }
+        previewBoxWidth = widthPx
+        previewBoxHeight = heightPx
+    }
+
+    /** 取景窗相对位图四边的裁切比例 */
+    private class PreviewEdgeInsets(
+        val top: Float,
+        val bottom: Float,
+        val left: Float,
+        val right: Float
+    )
+
+    /**
+     * 预览取景窗相对分析流位图的四边裁切比例
+     *
+     * 取景窗与位图比例不一致时，ContentScale.Crop 会裁掉超出部分：
+     * 横屏全屏铺满的窗口对 4:3 位图上下各裁约 20%，全屏竖屏则左右裁。
+     * 水印必须锚定在可见区内，否则会被切掉一半。
+     *
+     * 裁切比例用 UI 层上报的取景框实际尺寸计算（[setPreviewBoxSize]）；
+     * 尚未上报时按"无裁切"处理——宁可水印贴角，也不要在明明没裁切的
+     * 场景里把它推离角落（竖屏 4:3 取景框与位图同比例，无任何裁切）。
+     *
+     * @return 每边裁切比例（0 ~ 0.45）
+     */
+    private fun previewEdgeInsets(bitmap: Bitmap): PreviewEdgeInsets {
+        val boxW = previewBoxWidth.toFloat()
+        val boxH = previewBoxHeight.toFloat()
+        val bitmapW = bitmap.width.toFloat()
+        val bitmapH = bitmap.height.toFloat()
+        if (boxW <= 0f || boxH <= 0f || bitmapW <= 0f || bitmapH <= 0f) {
+            return PreviewEdgeInsets(0f, 0f, 0f, 0f)
+        }
+        val scale = maxOf(boxW / bitmapW, boxH / bitmapH)
+        val displayedW = bitmapW * scale
+        val displayedH = bitmapH * scale
+        val horizontal = ((displayedW - boxW) / displayedW / 2f).coerceIn(0f, 0.45f)
+        val vertical = ((displayedH - boxH) / displayedH / 2f).coerceIn(0f, 0.45f)
+        // 注意：这里只补偿"取景窗裁切"，不避让两侧控制列——
+        // 水印必须贴在取景窗左下角（用户明确的预期）；控制列声明在预览层之后，
+        // 按钮画在水印上方、照常可点。
+        return PreviewEdgeInsets(vertical, vertical, horizontal, horizontal)
     }
 
     /**
@@ -488,6 +556,9 @@ class FilterRepositoryImpl @Inject constructor(
             FilterType.WATERMARK_DEVICE -> WatermarkRenderer.WatermarkType.DEVICE
             FilterType.WATERMARK_CUSTOM -> WatermarkRenderer.WatermarkType.CUSTOM
             FilterType.WATERMARK_INFO -> WatermarkRenderer.WatermarkType.INFO
+            FilterType.WATERMARK_GRID -> WatermarkRenderer.WatermarkType.GRID
+            FilterType.WATERMARK_STAMP -> WatermarkRenderer.WatermarkType.STAMP
+            FilterType.WATERMARK_MINI -> WatermarkRenderer.WatermarkType.MINI
             else -> WatermarkRenderer.WatermarkType.TIMESTAMP                 // 默认时间戳
         }
     }

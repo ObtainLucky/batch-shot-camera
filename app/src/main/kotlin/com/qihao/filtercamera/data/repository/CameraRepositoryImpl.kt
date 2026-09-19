@@ -138,6 +138,9 @@ class CameraRepositoryImpl @Inject constructor(
         private const val ANALYSIS_HEIGHT = 720                           // 分析帧高度
         private const val FRAME_BUFFER_CAPACITY = 3                       // 帧缓冲区容量
         private const val FRAME_PROCESSING_INTERVAL_MS = 33L              // 帧处理间隔（约30fps）
+
+        /** 纯水印/无GPU滤镜模式的叠加间隔（20fps）：水印一秒才变一次，满帧重画纯属浪费 */
+        private const val WATERMARK_ONLY_INTERVAL_MS = 50L
         private const val START_TIMEOUT_MS = 5_000L                       // 等待录像真正开始的超时
 
         /** 方向变化后延迟重绑的防抖时间（等方向稳定下来再动相机） */
@@ -274,6 +277,34 @@ class CameraRepositoryImpl @Inject constructor(
             orientation < 135 -> Surface.ROTATION_270
             orientation < 225 -> Surface.ROTATION_180
             else -> Surface.ROTATION_90
+        }
+
+        /**
+         * 方向切换的角度阈值 = 45 度档位边界 + 5 度滞回
+         *
+         * 与 jetpack-camera-app 的 DebouncedOrientationFlow（Apache-2.0）一致：
+         * 新读数与上一次锁定方向角的角度差达到该值才允许切换方向。
+         */
+        private const val ORIENTATION_SNAP_THRESHOLD_DEGREES = 45 + 5
+
+        /**
+         * 角度滞回判断（纯函数，便于单测）
+         *
+         * 新读数与上一次锁定方向角的角度差（按圆周取最短弧）达到阈值才切换，
+         * 否则返回 null 表示保持原方向。
+         *
+         * 与"按时间防抖"的区别：滞回按**几何位置**判定 —— 手机停在档位边界
+         * （如 45 度）附近时，无论停多久都不会切换，也就不会反复触发重绑。
+         *
+         * @param prevDegrees 上一次锁定的方向角（0/90/180/270）
+         * @param reading 传感器读数（0..359）
+         * @return 新锁定的方向角（度，0/90/180/270）；滞回区内返回 null
+         */
+        internal fun snappedOrientationDegrees(prevDegrees: Int, reading: Int): Int? {
+            val shortest = kotlin.math.abs(prevDegrees - reading)
+                .let { kotlin.math.min(it, 360 - it) }
+            if (shortest < ORIENTATION_SNAP_THRESHOLD_DEGREES) return null
+            return orientationToSurfaceRotation(reading) * 90
         }
     }
 
@@ -440,6 +471,14 @@ class CameraRepositoryImpl @Inject constructor(
         processingIntervalMs = FRAME_PROCESSING_INTERVAL_MS
     )
 
+    /** 当前叠加层的目标帧间隔（分析流节流与处理器节奏共用这一个值） */
+    @Volatile
+    private var previewIntervalMs = FRAME_PROCESSING_INTERVAL_MS
+
+    /** 上次分析流提交时间（elapsedRealtime ms），用于分析流节流 */
+    @Volatile
+    private var lastAnalysisSubmitAt = 0L
+
     // 当前镜头状态
     private val _currentLens = MutableStateFlow(CameraLens.BACK)
 
@@ -560,6 +599,14 @@ class CameraRepositoryImpl @Inject constructor(
     /** 设备方向监听器（不依赖系统"自动旋转"开关，和系统相机一致） */
     private var orientationListener: OrientationEventListener? = null
 
+    /**
+     * 当前锁定的方向角（0/90/180/270 度）
+     *
+     * 滞回判断的基准：新读数必须与它相差足够大才允许切换方向。
+     */
+    @Volatile
+    private var lastSnappedDegrees = 0
+
     /** 方向变化后的重绑任务（用于防抖，方向抖动时不做多次重绑） */
     private var rotationRebindJob: Job? = null
 
@@ -585,7 +632,16 @@ class CameraRepositoryImpl @Inject constructor(
         val listener = object : OrientationEventListener(context) {
             override fun onOrientationChanged(orientation: Int) {
                 if (orientation == ORIENTATION_UNKNOWN) return                   // 手机平放，无法判断
-                applyDisplayRotation(orientationToSurfaceRotation(orientation))
+
+                // 角度滞回：读数必须离上一次锁定的方向足够远才切换。
+                // 没有这一步，手机停在 45 度档位边界附近时方向会两档之间反复横跳，
+                // 每次都触发一次相机重绑、预览不停闪 —— 时间防抖压不住这种抖动。
+                val snapped = Companion.snappedOrientationDegrees(
+                    lastSnappedDegrees, orientation
+                ) ?: return
+                lastSnappedDegrees = snapped
+                // snapped 是 0/90/180/270 度，正好对应 ROTATION_0/1/2/3
+                applyDisplayRotation(snapped / 90)
             }
         }
 
@@ -996,6 +1052,15 @@ class CameraRepositoryImpl @Inject constructor(
                 return
             }
 
+            // 分析流节流：叠加层只有 20/30fps 的消费节奏，相机 30fps 全部转换
+            // 有 1/3 以上是白算的（转换线程是最重的单项开销）。间隔与
+            // frameProcessor 的处理节奏保持一致，只转换会被消费的帧。
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastAnalysisSubmitAt < previewIntervalMs - 5) {
+                return
+            }
+            lastAnalysisSubmitAt = now
+
             // 将YUV转换为Bitmap（快速转换）
             val bitmap = yuvImageProxyToBitmap(imageProxy)
             if (bitmap == null) {
@@ -1053,6 +1118,16 @@ class CameraRepositoryImpl @Inject constructor(
         try {
             val filterType = currentFilterType
             val intensity = beautyIntensity
+
+            // 按当前效果动态调整叠加帧率：只有 GPU 滤镜在跑时保持满帧（取景流畅优先）；
+            // 纯水印/无效果时降到 20fps——水印一秒才变一次，满帧重画纯属浪费 CPU 和电
+            val interval = if (filterType != FilterType.NONE && filterType.useGpu) {
+                FRAME_PROCESSING_INTERVAL_MS
+            } else {
+                WATERMARK_ONLY_INTERVAL_MS
+            }
+            previewIntervalMs = interval
+            frameProcessor.setProcessingInterval(interval)
 
             // 更新原始预览帧（用于生成滤镜缩略图）
             if (_rawPreviewFrame.value == null) {

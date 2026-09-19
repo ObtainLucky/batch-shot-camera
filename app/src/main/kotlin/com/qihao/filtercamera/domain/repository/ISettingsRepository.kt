@@ -22,6 +22,7 @@ package com.qihao.filtercamera.domain.repository
 
 import com.qihao.filtercamera.domain.model.FilterType
 import com.qihao.filtercamera.domain.model.WatermarkField
+import com.qihao.filter.watermark.WatermarkRenderer
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -197,6 +198,18 @@ interface ISettingsRepository {
      * @param scale 倍率，建议 0.5~2.0
      */
     suspend fun setWatermarkSizeScale(scale: Float)
+
+    /**
+     * 获取水印位置（信息类水印生效，默认左下）
+     * @return 位置 Flow
+     */
+    fun getWatermarkPosition(): Flow<WatermarkRenderer.WatermarkPosition>
+
+    /**
+     * 设置水印位置
+     * @param position 四角位置之一
+     */
+    suspend fun setWatermarkPosition(position: WatermarkRenderer.WatermarkPosition)
 
     // ==================== 保存位置设置 ====================
 

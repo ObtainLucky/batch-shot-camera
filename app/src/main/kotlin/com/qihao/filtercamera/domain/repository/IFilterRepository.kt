@@ -112,6 +112,18 @@ interface IFilterRepository {
     fun isInfoWatermarkEnabled(): Boolean
 
     /**
+     * 上报预览取景框的实际显示尺寸（px）
+     *
+     * 全屏铺满等场景下，取景框与水印位图比例不一致，Crop 会裁掉位图边缘，
+     * 水印必须锚定在"看得见的区域"内。裁切比例取决于取景框的真实尺寸，
+     * 只有 UI 层测得到，这里由界面在尺寸变化时上报。
+     *
+     * @param widthPx 取景框宽度（0 表示尚未测量，水印按无裁切处理）
+     * @param heightPx 取景框高度
+     */
+    fun setPreviewBoxSize(widthPx: Int, heightPx: Int)
+
+    /**
      * 初始化滤镜引擎
      * @param width 渲染宽度
      * @param height 渲染高度

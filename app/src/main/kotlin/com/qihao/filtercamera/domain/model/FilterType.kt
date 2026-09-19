@@ -156,7 +156,7 @@ enum class FilterType(
     WALDEN("Walden", FilterGroup.INSTAGRAM),           // 黄色调增强
     XPROII("X-Pro II", FilterGroup.INSTAGRAM),         // 高对比，暗角
 
-    // ========== 水印相机（5种）- Canvas绘制 ==========
+    // ========== 水印相机（8种）- Canvas绘制 ==========
     // 参考数码相机时间戳水印设计
     // 水印使用Canvas绘制，不使用GPU Shader
     WATERMARK_TIMESTAMP("时间戳", FilterGroup.WATERMARK, useGpu = false),         // 日期时间水印（数码相机风格）
@@ -164,6 +164,9 @@ enum class FilterType(
     WATERMARK_DEVICE("设备信息", FilterGroup.WATERMARK, useGpu = false),          // 设备型号+镜头（类似徕卡水印）
     WATERMARK_CUSTOM("自定义", FilterGroup.WATERMARK, useGpu = false),            // 用户自定义文字
     WATERMARK_INFO("信息水印", FilterGroup.WATERMARK, useGpu = false),            // 经纬度/地址/时间/天气/备注 多行面板
+    WATERMARK_GRID("工程表格", FilterGroup.WATERMARK, useGpu = false),            // 线框表格：时间大字+经纬度并排+地址/天气/备注
+    WATERMARK_STAMP("大字时间", FilterGroup.WATERMARK, useGpu = false),           // 大号时间+小号地址/天气，无底板
+    WATERMARK_MINI("极简", FilterGroup.WATERMARK, useGpu = false),                // 单行胶囊：时间·天气·备注
 
     // ========== 图像调整（7种）- GPU Shader参数 ==========
     CONTRAST("对比度", FilterGroup.ADJUST),            // GPU: 对比度调整

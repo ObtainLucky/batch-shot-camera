@@ -108,6 +108,11 @@ class WatermarkInfoProvider @Inject constructor(
     @Volatile
     private var sizeScale: Float = WatermarkRenderer.DEFAULT_SIZE_SCALE
 
+    /** 水印位置（信息类水印生效，默认左下） */
+    @Volatile
+    private var position: WatermarkRenderer.WatermarkPosition =
+        WatermarkRenderer.WatermarkPosition.DEFAULT
+
     /**
      * 当前批次自己的备注
      *
@@ -167,7 +172,8 @@ class WatermarkInfoProvider @Inject constructor(
             customText = batchNote.ifBlank { remark }
                 .takeIf { WatermarkField.REMARK in enabledFields } ?: "",
             includeTimestamp = WatermarkField.TIME in enabledFields,
-            sizeScale = sizeScale
+            sizeScale = sizeScale,
+            position = position
         )
     }
 
@@ -404,6 +410,15 @@ class WatermarkInfoProvider @Inject constructor(
                         "observeSettings: 启用字段=" +
                             fields.joinToString(",") { it.id }
                     )
+                }
+        }
+
+        applicationScope.launch {
+            settingsRepository.getWatermarkPosition()
+                .catch { Log.w(TAG, "observeSettings: 读取水印位置失败", it) }
+                .collect { newPosition ->
+                    position = newPosition
+                    Log.d(TAG, "observeSettings: 水印位置=${newPosition.id}")
                 }
         }
     }

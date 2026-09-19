@@ -30,6 +30,7 @@ import com.qihao.filtercamera.domain.repository.PhotoQuality
 import com.qihao.filtercamera.domain.repository.SaveLocation
 import com.qihao.filtercamera.domain.repository.ThemeMode
 import com.qihao.filtercamera.domain.repository.VideoQuality
+import com.qihao.filter.watermark.WatermarkRenderer
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -301,6 +302,34 @@ class SettingsRepositoryImpl @Inject constructor(
         Log.d(TAG, "setWatermarkSizeScale: $clamped")
         dataStore.edit { preferences ->
             preferences[SettingsKeys.WATERMARK_SIZE_SCALE] = clamped
+        }
+    }
+
+    /**
+     * 获取水印位置
+     */
+    override fun getWatermarkPosition(): Flow<WatermarkRenderer.WatermarkPosition> = dataStore.data
+        .catch { exception ->
+            Log.e(TAG, "getWatermarkPosition: 读取失败", exception)
+            if (exception is IOException) {
+                emit(androidx.datastore.preferences.core.emptyPreferences())
+            } else {
+                throw exception
+            }
+        }
+        .map { preferences ->
+            WatermarkRenderer.WatermarkPosition.fromId(
+                preferences[SettingsKeys.WATERMARK_POSITION]
+            )
+        }
+
+    /**
+     * 设置水印位置
+     */
+    override suspend fun setWatermarkPosition(position: WatermarkRenderer.WatermarkPosition) {
+        Log.d(TAG, "setWatermarkPosition: ${position.id}")
+        dataStore.edit { preferences ->
+            preferences[SettingsKeys.WATERMARK_POSITION] = position.id
         }
     }
 
